@@ -5,6 +5,10 @@
 // @description  Configurable gang administration tools for incentive payouts, loan reconciliation, and Gangsters Paradise Awake exports.
 // @match        *://www.hobowars.com/game/game.php*
 // @match        *://hobowars.com/game/game.php*
+// @homepageURL  https://github.com/lvl11evelyn/hw7-gang-tools
+// @supportURL   https://github.com/lvl11evelyn/hw7-gang-tools/issues
+// @updateURL    https://github.com/lvl11evelyn/hw7-gang-tools/raw/refs/heads/main/HW%20Gang%20Tools%20Suite.user.js
+// @downloadURL  https://github.com/lvl11evelyn/hw7-gang-tools/raw/refs/heads/main/HW%20Gang%20Tools%20Suite.user.js
 // @run-at       document-end
 // @grant        GM_info
 // ==/UserScript==
