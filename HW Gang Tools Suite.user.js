@@ -1,14 +1,10 @@
 // ==UserScript==
 // @name         HW Gang Tools Suite
 // @namespace    https://www.hobowars.com/
-// @version      1.0
+// @version      1.1
 // @description  Configurable gang administration tools for incentive payouts, loan reconciliation, and Gangsters Paradise Awake exports.
 // @match        *://www.hobowars.com/game/game.php*
 // @match        *://hobowars.com/game/game.php*
-// @homepageURL  https://github.com/lvl11evelyn/hw7-gang-tools
-// @supportURL   https://github.com/lvl11evelyn/hw7-gang-tools/issues
-// @updateURL    https://github.com/lvl11evelyn/hw7-gang-tools/raw/refs/heads/main/HW%20Gang%20Tools%20Suite.user.js
-// @downloadURL  https://github.com/lvl11evelyn/hw7-gang-tools/raw/refs/heads/main/HW%20Gang%20Tools%20Suite.user.js
 // @run-at       document-end
 // @grant        GM_info
 // ==/UserScript==
@@ -274,7 +270,7 @@ function HW_registerSharedSettingsProvider(panel, provider) {
 
 const HWGT_SETTINGS_KEY = 'hwGangTools.moduleStates.v1';
 const HWGT_MODULES = Object.freeze([
-    ['gila', 'Gang Incentives and Loans Aid', 'v1.4'],
+    ['gila', 'Gang Incentives and Loans Aid', 'v1.5'],
     ['gp-exporter', 'GP Awake Exporter', 'v1.5']
 ]);
 
@@ -443,7 +439,7 @@ function HWGT_setModuleEnabled(id, enabled) {
     });
 })();
 
-/* ===== Component 1: HW Gang Incentives and Loans Aid v1.4 ===== */
+/* ===== Component 1: HW Gang Incentives and Loans Aid v1.5 ===== */
 (function () {
     'use strict';
 
@@ -478,6 +474,45 @@ function HWGT_setModuleEnabled(id, enabled) {
     const MINING_UNION_EXPLOSIVE_BY_NAME = new Map(
         MINING_UNION_EXPLOSIVES.map(item => [item.name.toLowerCase(), item])
     );
+    const DRINK_TANK_THREAD_ID = '20610095';
+    const DRINK_TANK_TIERS = Object.freeze([400, 500, 600, 800]);
+    const DRINK_TANK_DRINKS = Object.freeze([
+        {
+            name: 'Five Star General',
+            memo: 'FSGs',
+            cw: 20,
+            flat: 0,
+            aliases: /\b(?:five\s*star\s*generals?|f\.?\s*s\.?\s*g(?:\.?['’]?s)?|5\.?\s*s\.?\s*g(?:\.?['’]?s)?|fsgens?|generals?|gens)\b/i
+        },
+        {
+            name: 'Rainbow Road',
+            memo: 'RRs',
+            cw: 24,
+            flat: 0,
+            aliases: /\b(?:rainbow\s*roads?|r\.?\s*roads?|r\.?\s*r(?:\.?['’]?s)?)\b/i
+        },
+        {
+            name: 'Centrifuge',
+            memo: 'Centrifuges',
+            cw: 38,
+            flat: 600,
+            aliases: /(?:\bcentrifuges?\b|(?:^|\s)['’]?fuges?\b|\bnukes?\b)/i
+        },
+        {
+            name: 'Ten Foot Drop',
+            memo: 'TFDs',
+            cw: 18,
+            flat: 400,
+            aliases: /\b(?:ten\s*foot\s*drops?|t\.?\s*f\.?\s*d(?:\.?['’]?s)?|10\s*[-.]?\s*f\.?\s*d(?:\.?['’]?s)?)\b/i
+        },
+        {
+            name: 'The Long Walk',
+            memo: 'TLWs',
+            cw: 36,
+            flat: 0,
+            aliases: /\b(?:the\s*long\s*walks?|t\.?\s*l\.?\s*w\.?)\b/i
+        }
+    ]);
 
     const params = new URLSearchParams(window.location.search);
     const cmd = params.get('cmd') || '';
@@ -1060,6 +1095,221 @@ function HWGT_setModuleEnabled(id, enabled) {
             .replace(/\s+/g, ' ')
             .trim()
             .toLowerCase() === '** mining union **';
+    }
+
+    function isDrinkTankThread(threadTitle, threadId = '') {
+        if (String(threadId || '') === DRINK_TANK_THREAD_ID) return true;
+
+        const normalized = String(threadTitle || '')
+            .replace(/[’‘]/g, "'")
+            .replace(/[*_]+/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        return normalized.includes("jalu's drink tank") ||
+            normalized.includes("jalu' drink tank");
+    }
+
+    function getReadablePostText(postId) {
+        const body = document.getElementById(`post-content-${postId}`);
+        if (!body) return '';
+
+        const readable = body.cloneNode(true);
+        readable.querySelectorAll('br').forEach(br => {
+            br.replaceWith(document.createTextNode('\n'));
+        });
+
+        return String(readable.textContent || '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/[ \t]+/g, ' ')
+            .replace(/\r/g, '')
+            .trim();
+    }
+
+    function hasDirectPaidEdit(postId) {
+        const body = document.getElementById(`post-content-${postId}`);
+        if (!body) return false;
+
+        return Array.from(body.querySelectorAll('i')).some(marker => {
+            const boldPaid = Array.from(marker.querySelectorAll('b, strong'))
+                .some(node => /^\s*paid\s*$/i.test(node.textContent || ''));
+            return boldPaid && /\bedit\s*:\s*paid\b/i.test(marker.textContent || '');
+        });
+    }
+
+    function getPostLevel(postId) {
+        const row = document.getElementById(`tr_post_${postId}`);
+        const posterText = String(row?.cells?.[0]?.textContent || '');
+        const match = posterText.match(/\bLevel\s*:\s*([\d,]+)/i);
+        if (!match) return null;
+
+        const level = Number(match[1].replace(/,/g, ''));
+        return Number.isFinite(level) && level >= 0 ? level : null;
+    }
+
+    function getPostMonthKey(postId) {
+        const row = document.getElementById(`tr_post_${postId}`);
+        const stamp = String(row?.cells?.[0]?.querySelector('i')?.textContent || '').trim();
+        const match = stamp.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
+
+        if (match) {
+            const month = Number(match[1]);
+            let year = Number(match[3]);
+            if (year < 100) year += year >= 70 ? 1900 : 2000;
+            if (month >= 1 && month <= 12 && year >= 2000) {
+                return `${year}-${String(month).padStart(2, '0')}`;
+            }
+        }
+
+        const now = new Date();
+        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    }
+
+    function parseLooseInteger(value) {
+        const numeric = Number(String(value || '').replace(/[^0-9]/g, ''));
+        return Number.isSafeInteger(numeric) ? numeric : null;
+    }
+
+    function findDrinkTankQuantity(text, drink) {
+        const number = '(\\d{1,4}(?:,\\d{3})*)';
+        const alias = drink.aliases.source;
+        const flags = drink.aliases.flags.replace('g', '');
+        const patterns = [
+            new RegExp(`${number}\\s*(?:x|×|\\*)\\s*(?:${alias})`, flags),
+            new RegExp(`\\(${number}\\)\\s*(?:${alias})`, flags),
+            new RegExp(`${number}\\s+(?:${alias})`, flags),
+            new RegExp(`(?:${alias})[\\s\\S]{0,55}?(?:x|×|\\*)\\s*${number}`, flags),
+            new RegExp(`(?:${alias})[\\s\\S]{0,35}?\\(${number}\\)`, flags)
+        ];
+
+        for (const pattern of patterns) {
+            const match = text.match(pattern);
+            const quantity = parseLooseInteger(match?.[1]);
+            if (quantity !== null && quantity > 0) return quantity;
+        }
+
+        // Accommodate posts such as "58455 x 500 = ... For fsg", where the
+        // drink name follows the entire calculation. Prefer a recognized
+        // monthly tier, then the smaller operand as the likely quantity.
+        const operands = Array.from(
+            text.matchAll(/([\d,]+)\s*(?:x|×|\*)\s*\$?\s*([\d,]+)/gi)
+        );
+
+        for (const match of operands) {
+            const values = [parseLooseInteger(match[1]), parseLooseInteger(match[2])]
+                .filter(value => value !== null && value > 0);
+            const tier = values.find(value => DRINK_TANK_TIERS.includes(value));
+            if (tier) return tier;
+            if (values.length === 2) return Math.min(...values);
+        }
+
+        return null;
+    }
+
+    function findDrinkTankClaimedAmount(text) {
+        const amounts = [];
+        const number = '(\\d{1,3}(?:(?:,|\\s)\\d{3})+|\\d{4,})';
+        const patterns = [
+            new RegExp(`\\$+\\s*${number}`, 'g'),
+            new RegExp(`=\\s*\\$?\\s*${number}`, 'g'),
+            new RegExp(`\\bspent\\s*\\$?\\s*${number}`, 'gi')
+        ];
+
+        patterns.forEach(pattern => {
+            for (const match of text.matchAll(pattern)) {
+                const amount = parseLooseInteger(match[1]);
+                if (amount !== null && amount >= 1_000) amounts.push(amount);
+            }
+        });
+
+        const uniqueAmounts = Array.from(new Set(amounts));
+        return {
+            amount: uniqueAmounts.length ? Math.max(...uniqueAmounts) : null,
+            ambiguous: uniqueAmounts.length > 3
+        };
+    }
+
+    function getDrinkTankAllocatedQuantity(thread, hoboId, monthKey, excludeKey = '') {
+        return Object.entries(thread?.recipients || {}).reduce((sum, [key, recipient]) => {
+            if (key === excludeKey) return sum;
+            if (String(recipient?.hoboId || '') !== String(hoboId)) return sum;
+            if (recipient?.drinkTank?.monthKey !== monthKey) return sum;
+
+            const quantity = Number(recipient.drinkTank.payableQuantity);
+            return sum + (Number.isFinite(quantity) && quantity > 0 ? quantity : 0);
+        }, 0);
+    }
+
+    function parseDrinkTankClaim(postId, thread, hoboId, entryKey = '') {
+        const text = getReadablePostText(postId);
+        if (/\b(?:example|format)\s*:/i.test(text)) return null;
+
+        const matches = DRINK_TANK_DRINKS.filter(drink => drink.aliases.test(text));
+        if (matches.length !== 1) return null;
+
+        const drink = matches[0];
+        const level = getPostLevel(postId);
+        const quantity = findDrinkTankQuantity(text, drink);
+        if (!Number.isFinite(level) || !Number.isFinite(quantity) || quantity <= 0) return null;
+
+        const monthKey = getPostMonthKey(postId);
+        const allocated = getDrinkTankAllocatedQuantity(
+            thread,
+            hoboId,
+            monthKey,
+            entryKey
+        );
+        const requestedMonthlyTotal = allocated + quantity;
+        const cap = DRINK_TANK_TIERS.find(limit => requestedMonthlyTotal <= limit) || 800;
+        const remaining = Math.max(0, cap - allocated);
+        const payableQuantity = Math.min(quantity, remaining);
+        const crudweiserPrice = 257.5 + (level * 2.5);
+        const unitPrice = Math.round((drink.cw * crudweiserPrice) + drink.flat);
+        const calculatedAmount = payableQuantity * unitPrice;
+        const claimed = findDrinkTankClaimedAmount(text);
+        if (claimed.ambiguous) return null;
+        const claimedAmount = claimed.amount;
+        const amount = Number.isFinite(claimedAmount)
+            ? Math.min(claimedAmount, calculatedAmount)
+            : calculatedAmount;
+        const corrections = [
+            `Calculated payout: ${formatCurrency(calculatedAmount)} (${payableQuantity} ${drink.memo} at Level ${formatNumber(level)}).`
+        ];
+
+        if (payableQuantity < quantity) {
+            corrections.push(
+                `Monthly limit: ${formatNumber(payableQuantity)} of ${formatNumber(quantity)} requested drinks remain payable.`
+            );
+        }
+
+        if (Number.isFinite(claimedAmount) && claimedAmount < calculatedAmount) {
+            corrections.push(`Lower posted claim retained: ${formatCurrency(claimedAmount)}.`);
+        } else if (Number.isFinite(claimedAmount) && claimedAmount > calculatedAmount) {
+            corrections.push(`Posted claim corrected from ${formatCurrency(claimedAmount)}.`);
+        }
+
+        return {
+            amount,
+            memo: `${payableQuantity} ${drink.memo}`.substring(0, 60),
+            corrections,
+            drinkTank: {
+                monthKey,
+                drink: drink.name,
+                quantity,
+                payableQuantity,
+                level,
+                unitPrice,
+                calculatedAmount,
+                claimedAmount,
+                cap
+            }
+        };
+    }
+
+    function applyDrinkTankMetadata(recipient, parsed) {
+        if (!recipient || !parsed?.drinkTank) return;
+        recipient.drinkTank = { ...parsed.drinkTank };
     }
 
     function getSavedMemberMiningStat(hoboId) {
@@ -1683,7 +1933,7 @@ function HWGT_setModuleEnabled(id, enabled) {
 
         document.querySelectorAll('tr[id^="tr_post_"]').forEach(postRow => {
             const poster = getPoster(postRow);
-            if (poster && !unique.has(poster.id)) {
+            if (poster && !hasDirectPaidEdit(poster.postId) && !unique.has(poster.id)) {
                 unique.set(poster.id, poster);
             }
         });
@@ -1695,7 +1945,7 @@ function HWGT_setModuleEnabled(id, enabled) {
         // Mining Union claims are itemized and eligibility-gated. They must be
         // reviewed per reply so the generic bulk amount/memo path cannot
         // bypass the monthly cap or explosives restrictions.
-        if (isMiningUnionThread(threadTitle)) return;
+        if (isMiningUnionThread(threadTitle) || isDrinkTankThread(threadTitle, threadId)) return;
 
         const candidates = Array.from(
             document.querySelectorAll('b, strong, th, td, div, font, span')
@@ -1810,7 +2060,7 @@ function HWGT_setModuleEnabled(id, enabled) {
         delete button.dataset.completed;
         button.disabled = false;
 
-        if (recipient?.status === 'completed') {
+        if (recipient?.status === 'completed' || hasDirectPaidEdit(postId)) {
             button.textContent = 'Done ✓';
             button.classList.add('is-added', 'is-completed');
             button.dataset.completed = '1';
@@ -2294,18 +2544,24 @@ function HWGT_setModuleEnabled(id, enabled) {
 
         const inheritedAmount = String(thread.payout?.amount || '').replace(/[^0-9]/g, '');
         const inheritedMemo = String(thread.payout?.memo ?? threadTitle).substring(0, 60);
+        const drinkTank = isDrinkTankThread(threadTitle, threadId)
+            ? parseDrinkTankClaim(postId, thread, hoboId, entryKey)
+            : null;
         const milestone = isMilestoneIncentivesThread(threadTitle)
             ? collectMilestoneClaimsForHobo(hoboId, thread)
-            : parseMilestoneReply(postId);
+            : drinkTank
+                ? null
+                : parseMilestoneReply(postId);
+        const automatic = drinkTank || milestone;
         const amountValue = recipient?.amount !== null && recipient?.amount !== undefined
             ? String(recipient.amount)
-            : milestone?.amount
-                ? String(milestone.amount)
+            : automatic?.amount !== null && automatic?.amount !== undefined
+                ? String(automatic.amount)
                 : inheritedAmount;
         const memoValue = recipient?.memo !== null && recipient?.memo !== undefined
             ? String(recipient.memo)
-            : milestone?.memo
-                ? String(milestone.memo)
+            : automatic?.memo
+                ? String(automatic.memo)
                 : inheritedMemo;
 
         const backdrop = document.createElement('div');
@@ -2342,12 +2598,19 @@ function HWGT_setModuleEnabled(id, enabled) {
         if (
             recipient?.amount === null || recipient?.amount === undefined
         ) {
-            (milestone?.corrections || []).forEach(noteText => {
+            (automatic?.corrections || []).forEach(noteText => {
                 const correction = document.createElement('div');
                 correction.className = 'hwgila-milestone-correction';
                 correction.textContent = noteText;
                 form.appendChild(correction);
             });
+
+            if (isDrinkTankThread(threadTitle, threadId) && !drinkTank) {
+                const warning = document.createElement('div');
+                warning.className = 'hwgila-milestone-validation-line is-unknown hwgila-drink-tank-warning';
+                warning.textContent = '? No supported Drink Tank claim was found in this reply.';
+                form.appendChild(warning);
+            }
         }
 
         const memoLabel = document.createElement('label');
@@ -2397,6 +2660,7 @@ function HWGT_setModuleEnabled(id, enabled) {
                 if (isMilestoneIncentivesThread(threadTitle) && milestone) {
                     applyMilestoneBatchMetadata(savedRecipient, milestone);
                 }
+                if (drinkTank) applyDrinkTankMetadata(savedRecipient, drinkTank);
                 savedRecipient.status = 'completed';
                 savedRecipient.completedAt = Date.now();
                 savedRecipient.nativeLoanId = null;
@@ -2432,6 +2696,7 @@ function HWGT_setModuleEnabled(id, enabled) {
             if (isMilestoneIncentivesThread(threadTitle) && milestone) {
                 applyMilestoneBatchMetadata(nextThread.recipients[entryKey], milestone);
             }
+            if (drinkTank) applyDrinkTankMetadata(nextThread.recipients[entryKey], drinkTank);
 
             saveData(nextData);
             backdrop.remove();
@@ -2633,6 +2898,10 @@ function HWGT_setModuleEnabled(id, enabled) {
             .hwgila-milestone-validation-line.is-unknown {
                 color: #777;
                 font-style: italic;
+            }
+            .hwgila-drink-tank-warning {
+                margin: -2px 0 0 78px;
+                font-size: 11px;
             }
             .hwgila-mining-union-dialog {
                 width: min(470px, calc(100vw - 30px));
