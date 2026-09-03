@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HW Gang Tools Suite
 // @namespace    https://www.hobowars.com/
-// @version      1.1
+// @version      1.2
 // @description  Configurable gang administration tools for incentive payouts, loan reconciliation, and Gangsters Paradise Awake exports.
 // @match        *://www.hobowars.com/game/game.php*
 // @match        *://hobowars.com/game/game.php*
@@ -1207,9 +1207,46 @@ function HWGT_setModuleEnabled(id, enabled) {
         return null;
     }
 
-    function findDrinkTankClaimedAmount(text) {
-        const amounts = [];
+    function findDrinkTankLineAmount(text) {
         const number = '(\\d{1,3}(?:(?:,|\\s)\\d{3})+|\\d{4,})';
+        const matches = Array.from(
+            String(text || '').matchAll(new RegExp(`=\\s*\\$?\\s*${number}`, 'g'))
+        );
+        const amount = parseLooseInteger(matches.at(-1)?.[1]);
+        return amount !== null && amount >= 1_000 ? amount : null;
+    }
+
+    function findDrinkTankClaimedAmount(text, lineAmounts = []) {
+        const number = '(\\d{1,3}(?:(?:,|\\s)\\d{3})+|\\d{4,})';
+        const totalAmounts = Array.from(
+            String(text || '').matchAll(
+                new RegExp(`(?:^|\\n)\\s*(?:grand\\s+)?total\\b[^\\n\\d$]{0,20}\\$?\\s*${number}`, 'gi')
+            )
+        )
+            .map(match => parseLooseInteger(match[1]))
+            .filter(amount => amount !== null && amount >= 1_000);
+        const uniqueTotals = Array.from(new Set(totalAmounts));
+
+        if (uniqueTotals.length) {
+            return {
+                amount: uniqueTotals.length === 1 ? uniqueTotals[0] : null,
+                ambiguous: uniqueTotals.length > 1,
+                source: 'total'
+            };
+        }
+
+        const usableLineAmounts = lineAmounts.filter(
+            amount => Number.isFinite(amount) && amount >= 1_000
+        );
+        if (usableLineAmounts.length) {
+            return {
+                amount: usableLineAmounts.reduce((sum, amount) => sum + amount, 0),
+                ambiguous: false,
+                source: 'line-sum'
+            };
+        }
+
+        const amounts = [];
         const patterns = [
             new RegExp(`\\$+\\s*${number}`, 'g'),
             new RegExp(`=\\s*\\$?\\s*${number}`, 'g'),
@@ -1226,8 +1263,49 @@ function HWGT_setModuleEnabled(id, enabled) {
         const uniqueAmounts = Array.from(new Set(amounts));
         return {
             amount: uniqueAmounts.length ? Math.max(...uniqueAmounts) : null,
-            ambiguous: uniqueAmounts.length > 3
+            ambiguous: uniqueAmounts.length > 3,
+            source: 'fallback'
         };
+    }
+
+    function parseDrinkTankItems(text) {
+        const lines = String(text || '')
+            .split('\n')
+            .map(line => line.replace(/\s+/g, ' ').trim())
+            .filter(Boolean);
+        const items = [];
+
+        lines.forEach(line => {
+            const matches = DRINK_TANK_DRINKS.filter(drink => drink.aliases.test(line));
+            if (matches.length !== 1) return;
+
+            const drink = matches[0];
+            const quantity = findDrinkTankQuantity(line, drink);
+            if (!Number.isFinite(quantity) || quantity <= 0) return;
+
+            items.push({
+                drink,
+                quantity,
+                claimedLineAmount: findDrinkTankLineAmount(line)
+            });
+        });
+
+        if (items.length) return items;
+
+        // Retain support for prose-style, single-drink replies that do not
+        // place the calculation on its own line.
+        const matches = DRINK_TANK_DRINKS.filter(drink => drink.aliases.test(text));
+        if (matches.length !== 1) return [];
+
+        const drink = matches[0];
+        const quantity = findDrinkTankQuantity(text, drink);
+        if (!Number.isFinite(quantity) || quantity <= 0) return [];
+
+        return [{
+            drink,
+            quantity,
+            claimedLineAmount: findDrinkTankLineAmount(text)
+        }];
     }
 
     function getDrinkTankAllocatedQuantity(thread, hoboId, monthKey, excludeKey = '') {
@@ -1245,13 +1323,11 @@ function HWGT_setModuleEnabled(id, enabled) {
         const text = getReadablePostText(postId);
         if (/\b(?:example|format)\s*:/i.test(text)) return null;
 
-        const matches = DRINK_TANK_DRINKS.filter(drink => drink.aliases.test(text));
-        if (matches.length !== 1) return null;
+        const items = parseDrinkTankItems(text);
+        if (!items.length) return null;
 
-        const drink = matches[0];
         const level = getPostLevel(postId);
-        const quantity = findDrinkTankQuantity(text, drink);
-        if (!Number.isFinite(level) || !Number.isFinite(quantity) || quantity <= 0) return null;
+        if (!Number.isFinite(level)) return null;
 
         const monthKey = getPostMonthKey(postId);
         const allocated = getDrinkTankAllocatedQuantity(
@@ -1260,21 +1336,76 @@ function HWGT_setModuleEnabled(id, enabled) {
             monthKey,
             entryKey
         );
+        const quantity = items.reduce((sum, item) => sum + item.quantity, 0);
         const requestedMonthlyTotal = allocated + quantity;
         const cap = DRINK_TANK_TIERS.find(limit => requestedMonthlyTotal <= limit) || 800;
-        const remaining = Math.max(0, cap - allocated);
-        const payableQuantity = Math.min(quantity, remaining);
+        let remaining = Math.max(0, cap - allocated);
         const crudweiserPrice = 257.5 + (level * 2.5);
-        const unitPrice = Math.round((drink.cw * crudweiserPrice) + drink.flat);
-        const calculatedAmount = payableQuantity * unitPrice;
-        const claimed = findDrinkTankClaimedAmount(text);
+
+        const calculatedItems = items.map(item => {
+            const payableQuantity = Math.min(item.quantity, remaining);
+            remaining -= payableQuantity;
+
+            const unitPrice = Math.round(
+                (item.drink.cw * crudweiserPrice) + item.drink.flat
+            );
+            const bartenderGuideUnitPrice = Math.round(unitPrice * 0.9);
+
+            return {
+                ...item,
+                payableQuantity,
+                unitPrice,
+                bartenderGuideUnitPrice,
+                calculatedAmount: payableQuantity * unitPrice,
+                bartenderGuideCalculatedAmount: payableQuantity * bartenderGuideUnitPrice
+            };
+        });
+
+        const payableQuantity = calculatedItems.reduce(
+            (sum, item) => sum + item.payableQuantity,
+            0
+        );
+        const regularCalculatedAmount = calculatedItems.reduce(
+            (sum, item) => sum + item.calculatedAmount,
+            0
+        );
+        const bartenderGuideCalculatedAmount = calculatedItems.reduce(
+            (sum, item) => sum + item.bartenderGuideCalculatedAmount,
+            0
+        );
+        const claimed = findDrinkTankClaimedAmount(
+            text,
+            calculatedItems.map(item => item.claimedLineAmount)
+        );
         if (claimed.ambiguous) return null;
+
         const claimedAmount = claimed.amount;
+        const pricingOptions = [
+            {
+                bartenderGuide: false,
+                amount: regularCalculatedAmount,
+                difference: Number.isFinite(claimedAmount)
+                    ? Math.abs(regularCalculatedAmount - claimedAmount)
+                    : Infinity
+            },
+            {
+                bartenderGuide: true,
+                amount: bartenderGuideCalculatedAmount,
+                difference: Number.isFinite(claimedAmount)
+                    ? Math.abs(bartenderGuideCalculatedAmount - claimedAmount)
+                    : Infinity
+            }
+        ].sort((a, b) =>
+            (a.difference - b.difference) || (a.amount - b.amount)
+        );
+        const selectedPricing = pricingOptions[0];
+        const calculatedAmount = selectedPricing.amount;
         const amount = Number.isFinite(claimedAmount)
             ? Math.min(claimedAmount, calculatedAmount)
             : calculatedAmount;
         const corrections = [
-            `Calculated payout: ${formatCurrency(calculatedAmount)} (${payableQuantity} ${drink.memo} at Level ${formatNumber(level)}).`
+            `Pricing: ${selectedPricing.bartenderGuide ? 'Bartender Guide (10% off)' : 'No Bartender Guide'} — closest calculation ${formatCurrency(calculatedAmount)} at Level ${formatNumber(level)}.`,
+            `Alternate ${selectedPricing.bartenderGuide ? 'without' : 'with'} Bartender Guide: ${formatCurrency(selectedPricing.bartenderGuide ? regularCalculatedAmount : bartenderGuideCalculatedAmount)}.`
         ];
 
         if (payableQuantity < quantity) {
@@ -1291,18 +1422,40 @@ function HWGT_setModuleEnabled(id, enabled) {
 
         return {
             amount,
-            memo: `${payableQuantity} ${drink.memo}`.substring(0, 60),
+            memo: calculatedItems
+                .filter(item => item.payableQuantity > 0)
+                .map(item => `${item.payableQuantity} ${item.drink.memo}`)
+                .join(', ')
+                .substring(0, 60),
             corrections,
             drinkTank: {
                 monthKey,
-                drink: drink.name,
+                drink: calculatedItems.length === 1
+                    ? calculatedItems[0].drink.name
+                    : 'Mixed',
                 quantity,
                 payableQuantity,
                 level,
-                unitPrice,
+                unitPrice: calculatedItems.length === 1
+                    ? calculatedItems[0].unitPrice
+                    : null,
                 calculatedAmount,
                 claimedAmount,
-                cap
+                cap,
+                bartenderGuide: selectedPricing.bartenderGuide,
+                regularCalculatedAmount,
+                bartenderGuideCalculatedAmount,
+                items: calculatedItems.map(item => ({
+                    drink: item.drink.name,
+                    memo: item.drink.memo,
+                    quantity: item.quantity,
+                    payableQuantity: item.payableQuantity,
+                    unitPrice: item.unitPrice,
+                    bartenderGuideUnitPrice: item.bartenderGuideUnitPrice,
+                    calculatedAmount: item.calculatedAmount,
+                    bartenderGuideCalculatedAmount: item.bartenderGuideCalculatedAmount,
+                    claimedLineAmount: item.claimedLineAmount
+                }))
             }
         };
     }
