@@ -1,8 +1,11 @@
 // ==UserScript==
 // @name         HW Gang Tools Suite
 // @namespace    https://www.hobowars.com/
-// @version      1.2
-// @description  Configurable gang administration tools for incentive payouts, loan reconciliation, and Gangsters Paradise Awake exports.
+// @version      2.0
+// @description  Configurable gang administration tools for incentive payouts, loan reconciliation, member-stat deltas, and Gangsters Paradise Awake exports.
+// @homepageURL  https://github.com/lvl11evelyn/hw7-gang-tools/blob/main/README.md
+// @updateURL    https://github.com/lvl11evelyn/hw7-gang-tools/raw/refs/heads/main/HW%20Gang%20Tools%20Suite.user.js
+// @downloadURL  https://github.com/lvl11evelyn/hw7-gang-tools/raw/refs/heads/main/HW%20Gang%20Tools%20Suite.user.js
 // @match        *://www.hobowars.com/game/game.php*
 // @match        *://hobowars.com/game/game.php*
 // @run-at       document-end
@@ -271,8 +274,666 @@ function HW_registerSharedSettingsProvider(panel, provider) {
 const HWGT_SETTINGS_KEY = 'hwGangTools.moduleStates.v1';
 const HWGT_MODULES = Object.freeze([
     ['gila', 'Gang Incentives and Loans Aid', 'v1.5'],
-    ['gp-exporter', 'GP Awake Exporter', 'v1.5']
+    ['gp-exporter', 'GP Awake Exporter', 'v1.5'],
+    ['member-stats', 'Gang Member Stat Tracker', 'v1.2']
 ]);
+
+const HWGT_MEMBER_TRACKER_KEY = 'hwgt_member_stat_tracker_v2';
+const HWGT_MEMBER_CLASSIFICATIONS = Object.freeze({
+    warChamber: 'War Chamber',
+    juniorWarChamber: 'Junior War Chamber',
+    leadershipCouncil: 'Leadership Council',
+    gangStaff: 'Gang Staff',
+    gangMember: 'Gang Member',
+    formerMember: 'Former Member',
+    whitelist: 'Whitelist',
+    active: 'Active',
+    inactive: 'Inactive'
+});
+const HWGT_MEMBER_GROUPS = Object.freeze({
+    main: {
+        label: 'Main',
+        stats: Object.freeze({
+            level: ['ts_level', 'Level'],
+            age: ['ts_age', 'Age'],
+            lastActive: ['ts_la', 'Last Active'],
+            chamber: ['ts_chamber', 'Chamber'],
+            awakeUsed: ['ts_tired', 'Awake Used']
+        })
+    },
+    battle: {
+        label: 'Battle Stats',
+        stats: Object.freeze({
+            speed: ['ts_speed', 'Speed'],
+            power: ['ts_power', 'Power'],
+            strength: ['ts_strength', 'Strength'],
+            tbs: ['ts_tbs', 'TBS'],
+            life: ['ts_life', 'Life']
+        })
+    },
+    other: {
+        label: 'Other Stats',
+        stats: Object.freeze({
+            begging: ['ts_beg', 'Beg'],
+            intelligence: ['ts_intel', 'Intel'],
+            drinking: ['ts_drinking', 'Drinking'],
+            mining: ['ts_mining', 'Mining']
+        })
+    },
+    hall: {
+        label: 'Hall of Fame',
+        stats: Object.freeze({
+            experience: ['ts_exp', 'Exp'],
+            beggingIncome: ['ts_beg_income', 'Beg Income'],
+            cash: ['ts_cash', 'Cash'],
+            points: ['ts_points', 'Points'],
+            tokens: ['ts_tokens', 'Tokens'],
+            donatorPoints: ['ts_dps', 'DPs']
+        })
+    }
+});
+
+function HWGT_defaultMemberTrackerSettings() {
+    const today = new Date();
+    const defaultAnchor = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    const schedule = (frequency, options = {}) => ({
+        frequency,
+        weekday: options.weekday ?? 1,
+        monthDay: options.monthDay ?? 1,
+        time: options.time || '00:00',
+        intervalDays: options.intervalDays ?? 14,
+        anchorDate: options.anchorDate || defaultAnchor,
+        timezone: options.timezone || 'local'
+    });
+
+    return {
+        groups: {
+            main: { enabled: true, schedule: schedule('monthly', { monthDay: 1, time: '08:00' }), retention: { value: 6, unit: 'months' } },
+            battle: { enabled: true, schedule: schedule('weekly', { weekday: 1, time: '12:00' }), retention: { value: 6, unit: 'months' } },
+            other: { enabled: true, schedule: schedule('monthly', { monthDay: 1, time: '08:00' }), retention: { value: 6, unit: 'months' } },
+            hall: { enabled: true, schedule: schedule('monthly', { monthDay: 1, time: '08:00' }), retention: { value: 6, unit: 'months' } }
+        },
+        exceptions: {},
+        exceptionMode: 'invert',
+        export: { format: 'text' }
+    };
+}
+
+function HWGT_mergeMemberTrackerSettings(value) {
+    const defaults = HWGT_defaultMemberTrackerSettings();
+    const input = value && typeof value === 'object' ? value : {};
+
+    Object.keys(HWGT_MEMBER_GROUPS).forEach(groupId => {
+        const source = input.groups?.[groupId];
+        if (!source || typeof source !== 'object') return;
+        defaults.groups[groupId].enabled = source.enabled !== false;
+        Object.assign(defaults.groups[groupId].schedule, source.schedule || {});
+        if (!['local', 'server'].includes(defaults.groups[groupId].schedule.timezone)) {
+            defaults.groups[groupId].schedule.timezone =
+                defaults.groups[groupId].schedule.timezone === 'utc' ? 'server' : 'local';
+        }
+        Object.assign(defaults.groups[groupId].retention, source.retention || {});
+    });
+
+    const sourceExceptions = input.exceptions && typeof input.exceptions === 'object'
+        ? input.exceptions
+        : {};
+    defaults.exceptions = {};
+    Object.entries(sourceExceptions).forEach(([memberId, groups]) => {
+        if (!groups || typeof groups !== 'object') return;
+        Object.entries(groups).forEach(([groupId, value]) => {
+            if (!Object.hasOwn(HWGT_MEMBER_GROUPS, groupId)) return;
+            const isException = input.exceptionMode === 'invert'
+                ? value === true
+                : typeof value === 'boolean';
+            if (!isException) return;
+            if (!defaults.exceptions[memberId]) defaults.exceptions[memberId] = {};
+            defaults.exceptions[memberId][groupId] = true;
+        });
+    });
+    defaults.exceptionMode = 'invert';
+    Object.assign(defaults.export, input.export || {});
+    if (!['markdown', 'text', 'json'].includes(defaults.export.format)) {
+        defaults.export.format = 'text';
+    }
+    Object.values(defaults.groups).forEach(group => {
+        const limits = { days: 7, weeks: 52, months: 24 };
+        if (!Object.hasOwn(limits, group.retention.unit)) group.retention.unit = 'months';
+        group.retention.value = Math.min(
+            limits[group.retention.unit],
+            Math.max(1, Number(group.retention.value) || 1)
+        );
+    });
+    return defaults;
+}
+
+function HWGT_loadMemberTrackerData() {
+    let parsed = {};
+    try {
+        parsed = JSON.parse(localStorage.getItem(HWGT_MEMBER_TRACKER_KEY) || '{}');
+    } catch (_) {
+        parsed = {};
+    }
+
+    return {
+        schema: 3,
+        settings: HWGT_mergeMemberTrackerSettings(parsed.settings),
+        catalog: {
+            members: parsed.catalog?.members && typeof parsed.catalog.members === 'object'
+                ? parsed.catalog.members
+                : {}
+        },
+        sources: parsed.sources && typeof parsed.sources === 'object' ? parsed.sources : {},
+        epochs: Array.isArray(parsed.epochs) ? parsed.epochs : [],
+        events: Array.isArray(parsed.events) ? parsed.events : [],
+        visits: Array.isArray(parsed.visits) ? parsed.visits : []
+    };
+}
+
+function HWGT_saveMemberTrackerData(data) {
+    try {
+        localStorage.setItem(HWGT_MEMBER_TRACKER_KEY, JSON.stringify(data));
+        return true;
+    } catch (error) {
+        const newestByGroup = new Map();
+        data.epochs.forEach(epoch => {
+            if (!newestByGroup.has(epoch.group) || newestByGroup.get(epoch.group).boundaryAt < epoch.boundaryAt) {
+                newestByGroup.set(epoch.group, epoch);
+            }
+        });
+        const protectedIds = new Set(Array.from(newestByGroup.values()).map(epoch => epoch.id));
+        const removable = data.epochs
+            .filter(epoch => !protectedIds.has(epoch.id))
+            .sort((a, b) => a.boundaryAt - b.boundaryAt);
+
+        while (removable.length) {
+            const expired = removable.shift();
+            data.epochs = data.epochs.filter(epoch => epoch.id !== expired.id);
+            data.events = data.events.filter(event => event.epochId !== expired.id);
+            data.visits = data.visits.filter(visit => visit.epochId !== expired.id);
+            try {
+                localStorage.setItem(HWGT_MEMBER_TRACKER_KEY, JSON.stringify(data));
+                console.warn('HW Gang Member Stat Tracker: storage was full; the oldest retained epoch was removed.');
+                return true;
+            } catch (_) {
+                // Continue removing this component's oldest epochs only.
+            }
+        }
+
+        console.error('HW Gang Member Stat Tracker: the newest records could not be saved.', error);
+        return false;
+    }
+}
+
+function HWGT_updateMemberTrackerSettings(mutator) {
+    const data = HWGT_loadMemberTrackerData();
+    mutator(data.settings, data);
+    HWGT_saveMemberTrackerData(data);
+    return data;
+}
+
+function HWGT_retentionMilliseconds(retention) {
+    const value = Math.max(1, Number(retention?.value) || 1);
+    const unit = retention?.unit || 'months';
+    const day = 86_400_000;
+    if (unit === 'days') return value * day;
+    if (unit === 'weeks') return value * 7 * day;
+    return value * 30.4375 * day;
+}
+
+function HWGT_scheduleBoundary(schedule, nowMs = Date.now()) {
+    const serverTime = schedule?.timezone === 'server';
+    const serverOffsetMs = 10 * 60 * 60 * 1000;
+    const now = new Date(serverTime ? nowMs + serverOffsetMs : nowMs);
+    const [hour, minute] = String(schedule?.time || '00:00')
+        .split(':')
+        .map(value => Number(value) || 0);
+    const make = (year, month, day) => serverTime
+        ? Date.UTC(year, month, day, hour, minute, 0, 0) - serverOffsetMs
+        : new Date(year, month, day, hour, minute, 0, 0).getTime();
+    const parts = date => serverTime
+        ? [date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), date.getUTCDay()]
+        : [date.getFullYear(), date.getMonth(), date.getDate(), date.getDay()];
+    const [year, month, day, weekday] = parts(now);
+    const frequency = schedule?.frequency || 'weekly';
+
+    if (frequency === 'daily') {
+        let boundary = make(year, month, day);
+        if (boundary > nowMs) boundary -= 86_400_000;
+        return boundary;
+    }
+
+    if (frequency === 'weekly') {
+        const targetDay = Math.min(6, Math.max(0, Number(schedule?.weekday) || 0));
+        let offset = (weekday - targetDay + 7) % 7;
+        let boundary = make(year, month, day - offset);
+        if (boundary > nowMs) boundary = make(year, month, day - offset - 7);
+        return boundary;
+    }
+
+    if (frequency === 'monthly') {
+        const requestedDay = Math.min(31, Math.max(1, Number(schedule?.monthDay) || 1));
+        const daysInMonth = (y, m) => serverTime
+            ? new Date(Date.UTC(y, m + 1, 0)).getUTCDate()
+            : new Date(y, m + 1, 0).getDate();
+        let targetYear = year;
+        let targetMonth = month;
+        let targetDay = Math.min(requestedDay, daysInMonth(targetYear, targetMonth));
+        let boundary = make(targetYear, targetMonth, targetDay);
+        if (boundary > nowMs) {
+            targetMonth--;
+            if (targetMonth < 0) {
+                targetMonth = 11;
+                targetYear--;
+            }
+            targetDay = Math.min(requestedDay, daysInMonth(targetYear, targetMonth));
+            boundary = make(targetYear, targetMonth, targetDay);
+        }
+        return boundary;
+    }
+
+    const intervalDays = frequency === 'biweekly'
+        ? 14
+        : Math.min(3650, Math.max(1, Number(schedule?.intervalDays) || 1));
+    const anchorMatch = String(schedule?.anchorDate || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    const anchor = anchorMatch
+        ? make(Number(anchorMatch[1]), Number(anchorMatch[2]) - 1, Number(anchorMatch[3]))
+        : make(year, month, day);
+    const intervalMs = intervalDays * 86_400_000;
+    if (anchor > nowMs) return anchor - Math.ceil((anchor - nowMs) / intervalMs) * intervalMs;
+    return anchor + Math.floor((nowMs - anchor) / intervalMs) * intervalMs;
+}
+
+function HWGT_effectiveMemberTracking(settings, memberId, groupId) {
+    const defaultState = settings.groups[groupId]?.enabled !== false;
+    const excepted = settings.exceptions?.[memberId]?.[groupId] === true;
+    return excepted ? !defaultState : defaultState;
+}
+
+function HWGT_memberIsExcepted(settings, memberId, groupId) {
+    return settings.exceptions?.[memberId]?.[groupId] === true;
+}
+
+function HWGT_memberHasClassification(data, memberId, classification) {
+    if (!classification) return true;
+    return data.catalog.members?.[memberId]?.classifications?.[classification] === true;
+}
+
+function HWGT_parseTrackedNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const cleaned = String(value).replace(/[$,\s]/g, '');
+    return /^[-+]?\d+(?:\.\d+)?$/.test(cleaned) ? Number(cleaned) : null;
+}
+
+function HWGT_scheduleDateParts(schedule, nowMs = Date.now()) {
+    const date = new Date(schedule?.timezone === 'server' ? nowMs + 36_000_000 : nowMs);
+    return schedule?.timezone === 'server'
+        ? [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()]
+        : [date.getFullYear(), date.getMonth() + 1, date.getDate()];
+}
+
+function HWGT_compactAnchorDate(value) {
+    const match = String(value || '').match(/^\d{4}-(\d{2})-(\d{2})$/);
+    return match ? `${match[1]}/${match[2]}` : '';
+}
+
+function HWGT_resolveAnchorDate(value, previousValue, schedule, nowMs = Date.now()) {
+    const match = String(value || '').trim().match(/^(\d{1,2})\/(\d{1,2})$/);
+    if (!match) return previousValue;
+    const month = Number(match[1]);
+    const day = Number(match[2]);
+    const [currentYear, currentMonth] = HWGT_scheduleDateParts(schedule, nowMs);
+    let year = currentYear;
+    if (currentMonth === 12 && month === 1) year++;
+    if (currentMonth === 1 && month === 12) year--;
+    const candidate = new Date(Date.UTC(year, month - 1, day));
+    if (
+        month < 1 || month > 12 || day < 1 ||
+        candidate.getUTCFullYear() !== year ||
+        candidate.getUTCMonth() !== month - 1 ||
+        candidate.getUTCDate() !== day
+    ) return previousValue;
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function HWGT_snapshotRaw(member, statId) {
+    if (member?.rawValues && Object.hasOwn(member.rawValues, statId)) return member.rawValues[statId];
+    return member?.values?.[statId] ?? null;
+}
+
+function HWGT_exportTimestamp(value, timezone = 'local') {
+    const date = new Date(timezone === 'server' ? Number(value) + 36_000_000 : Number(value));
+    const read = method => timezone === 'server'
+        ? date[`getUTC${method}`]()
+        : date[`get${method}`]();
+    return `${String(read('Hours')).padStart(2, '0')}:${String(read('Minutes')).padStart(2, '0')} ` +
+        `${String(read('Month') + 1).padStart(2, '0')}/${String(read('Date')).padStart(2, '0')}/${read('FullYear')}`;
+}
+
+function HWGT_exportDelta(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '';
+    const formatted = HWGT_groupExportNumber(number);
+    return number > 0 ? `+${formatted}` : formatted;
+}
+
+function HWGT_groupExportNumber(value) {
+    if (value === null || value === undefined || value === '') return '';
+    const text = String(value).trim();
+    const match = text.replace(/,/g, '').match(/^([+-]?)(\d+)(\.\d+)?$/);
+    if (!match) return text;
+    const groupedInteger = match[2].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return `${match[1]}${groupedInteger}${match[3] || ''}`;
+}
+
+function HWGT_memberTrackerExportRows(data) {
+    const epochById = new Map(data.epochs.map(epoch => [epoch.id, epoch]));
+    const identity = (memberId, fallbackName = '') => {
+        const member = data.catalog.members?.[memberId] || {};
+        const classifications = Object.entries(HWGT_MEMBER_CLASSIFICATIONS)
+            .filter(([id]) => member.classifications?.[id] === true)
+            .map(([, label]) => label);
+        const suffixIds = [
+            ['warChamber', 'WC'], ['juniorWarChamber', 'JWC'],
+            ['leadershipCouncil', 'Council'], ['gangStaff', 'Staff']
+        ];
+        return {
+            memberName: member.name || fallbackName || `#${memberId}`,
+            memberId,
+            profileUrl: member.profileUrl || '',
+            classifications,
+            classificationSuffix: suffixIds
+                .filter(([id]) => member.classifications?.[id] === true)
+                .map(([, label]) => label),
+            whitelistTitle: member.whitelistTitle || ''
+        };
+    };
+    const common = (epoch, memberId, member, capturedAt) => {
+        const timezone = data.settings.groups?.[epoch.group]?.schedule?.timezone || 'local';
+        return {
+            capturedAt: new Date(capturedAt).toISOString(),
+            displayTimestamp: HWGT_exportTimestamp(capturedAt, timezone),
+            epochBoundary: new Date(epoch.boundaryAt).toISOString(),
+            category: HWGT_MEMBER_GROUPS[epoch.group]?.label || epoch.group,
+            categoryId: epoch.group,
+            ...identity(memberId, member?.name),
+            membershipState: member?.membershipState || 'current'
+        };
+    };
+    const rows = [];
+
+    data.epochs.forEach(epoch => {
+        Object.entries(epoch.baseline || {}).forEach(([memberId, member]) => {
+            Object.keys(member.rawValues || member.values || {}).forEach(statId => {
+                const value = HWGT_snapshotRaw(member, statId);
+                rows.push({
+                    ...common(epoch, memberId, member, member.capturedAt || epoch.firstCapturedAt),
+                    stat: HWGT_MEMBER_GROUPS[epoch.group]?.stats?.[statId]?.[1] || statId,
+                    statId,
+                    latestValue: value,
+                    priorSnapshot: null,
+                    firstSnapshot: value,
+                    intervalDelta: 0,
+                    epochDelta: 0
+                });
+            });
+        });
+    });
+
+    data.events.forEach(event => {
+        const epoch = epochById.get(event.epochId);
+        if (!epoch) return;
+        Object.entries(event.changes || {}).forEach(([statId, change]) => {
+            const baseline = epoch.baseline?.[event.memberId];
+            rows.push({
+                ...common(epoch, event.memberId, event, event.at),
+                stat: HWGT_MEMBER_GROUPS[event.group]?.stats?.[statId]?.[1] || statId,
+                statId,
+                latestValue: change.toRaw ?? change.to ?? null,
+                priorSnapshot: change.fromRaw ?? change.from ?? null,
+                firstSnapshot: HWGT_snapshotRaw(baseline, statId),
+                intervalDelta: change.delta,
+                epochDelta: change.epochDelta
+            });
+        });
+    });
+
+    return rows.sort((a, b) =>
+        Date.parse(b.capturedAt) - Date.parse(a.capturedAt) ||
+        a.category.localeCompare(b.category) ||
+        a.memberName.localeCompare(b.memberName) ||
+        a.stat.localeCompare(b.stat)
+    );
+}
+
+function HWGT_markdownExport(rows) {
+    const escape = value => String(value ?? '').replace(/([\\`*_[\]<>])/g, '\\$1');
+    const categories = new Map();
+    rows.forEach(row => {
+        if (!categories.has(row.category)) categories.set(row.category, new Map());
+        const dates = categories.get(row.category);
+        if (!dates.has(row.displayTimestamp)) dates.set(row.displayTimestamp, new Map());
+        const members = dates.get(row.displayTimestamp);
+        if (!members.has(row.memberId)) members.set(row.memberId, []);
+        members.get(row.memberId).push(row);
+    });
+    const output = [];
+    categories.forEach((dates, category) => {
+        output.push(`## ${escape(category)}`, '');
+        dates.forEach((members, timestamp) => {
+            output.push(`### ${timestamp}`, '');
+            members.forEach(memberRows => {
+                const first = memberRows[0];
+                const name = escape(first.memberName);
+                const linkedName = first.profileUrl ? `[${name}](${first.profileUrl})` : name;
+                const suffix = first.classificationSuffix.length
+                    ? ` — ${escape(first.classificationSuffix.join(', '))}`
+                    : '';
+                output.push(`**${linkedName} (${escape(first.memberId)})**${suffix}`);
+                memberRows.forEach(row => {
+                    output.push(
+                        `- ${escape(row.stat)} — ${escape(HWGT_groupExportNumber(row.latestValue))} ` +
+                        `[${escape(HWGT_groupExportNumber(row.priorSnapshot))}] ` +
+                        `(*${escape(HWGT_exportDelta(row.intervalDelta))}* | *${escape(HWGT_exportDelta(row.epochDelta))}*)`
+                    );
+                });
+                output.push('');
+            });
+        });
+    });
+    return output.join('\n').trim();
+}
+
+function HWGT_plainTextExport(rows) {
+    const valueWidths = {
+        speed: 10,
+        power: 10,
+        strength: 10,
+        tbs: 10,
+        life: 10,
+        begging: 5,
+        mining: 5,
+        drinking: 5,
+        intelligence: 5,
+        level: 5,
+        age: 6,
+        lastActive: 6
+    };
+    const statValue = (value, statId) => {
+        const formatted = HWGT_groupExportNumber(value);
+        const width = valueWidths[statId] || 0;
+        return width ? formatted.padStart(width) : formatted;
+    };
+    const statLabelWidth = rows.reduce(
+        (longest, row) => Math.max(longest, String(row.stat || '').length),
+        0
+    ) + 1;
+    const members = new Map();
+    rows.forEach(row => {
+        if (!members.has(row.memberId)) members.set(row.memberId, []);
+        members.get(row.memberId).push(row);
+    });
+    const output = [];
+    members.forEach(memberRows => {
+        memberRows.sort((a, b) => Date.parse(b.capturedAt) - Date.parse(a.capturedAt));
+        const first = memberRows[0];
+        const suffix = first.classificationSuffix.length
+            ? ` - ${first.classificationSuffix.join(', ')}`
+            : '';
+        const memberIdentity = `${first.memberName} (${first.memberId})`.padEnd(35);
+        output.push(`${memberIdentity}${suffix}`);
+        memberRows.forEach(row => {
+            const statLabel = String(row.stat || '').padEnd(statLabelWidth);
+            const latestValue = statValue(row.latestValue, row.statId);
+            const priorSnapshot = statValue(row.priorSnapshot, row.statId);
+            output.push(
+                `${row.displayTimestamp} ${statLabel}- ${latestValue} ` +
+                `[${priorSnapshot}] ` +
+                `(${HWGT_exportDelta(row.intervalDelta)} | ${HWGT_exportDelta(row.epochDelta)})`
+            );
+        });
+        output.push('');
+    });
+    return output.join('\n').trim();
+}
+
+function HWGT_buildMemberTrackerExport(data, format) {
+    const rows = HWGT_memberTrackerExportRows(data);
+    if (format === 'markdown') {
+        return { text: HWGT_markdownExport(rows), mime: 'text/markdown', extension: 'md' };
+    }
+    if (format === 'text') {
+        return { text: HWGT_plainTextExport(rows), mime: 'text/plain', extension: 'txt' };
+    }
+    if (format === 'json') {
+        return { text: JSON.stringify(rows, null, 2), mime: 'application/json', extension: 'json' };
+    }
+    return { text: HWGT_plainTextExport(rows), mime: 'text/plain', extension: 'txt' };
+}
+
+function HWGT_deleteMemberTrackerData(filters, commit = false) {
+    const data = HWGT_loadMemberTrackerData();
+    const groupMatches = group => !filters.group || filters.group === group;
+    const epochMatches = epochId => !filters.epoch || filters.epoch === epochId;
+    const memberMatches = memberId => !filters.memberId || filters.memberId === memberId;
+    const classificationMatches = memberId =>
+        HWGT_memberHasClassification(data, memberId, filters.classification);
+    const hasMagnitude = Number.isFinite(filters.minMagnitude) || Number.isFinite(filters.maxMagnitude);
+    const hasBreakpoint = Number.isFinite(filters.breakpoint) && filters.breakpoint > 0;
+    const changeMatches = change => {
+        const delta = Number(change?.delta);
+        if (hasMagnitude) {
+            if (!Number.isFinite(delta)) return false;
+            const magnitude = Math.abs(delta);
+            if (Number.isFinite(filters.minMagnitude) && magnitude < filters.minMagnitude) return false;
+            if (Number.isFinite(filters.maxMagnitude) && magnitude > filters.maxMagnitude) return false;
+        }
+        if (hasBreakpoint) {
+            const from = Number(change?.fromNumeric ?? HWGT_parseTrackedNumber(change?.from));
+            const to = Number(change?.toNumeric ?? HWGT_parseTrackedNumber(change?.to));
+            if (!Number.isFinite(from) || !Number.isFinite(to)) return false;
+            const crossed =
+                Math.floor(Math.abs(from) / filters.breakpoint) !==
+                Math.floor(Math.abs(to) / filters.breakpoint);
+            if (filters.breakpointMode === 'crossed' && !crossed) return false;
+            if (filters.breakpointMode === 'not-crossed' && crossed) return false;
+        }
+        return true;
+    };
+
+    let eventCount = 0;
+    let changeCount = 0;
+    const remainingEvents = [];
+    data.events.forEach(event => {
+        if (
+            !groupMatches(event.group) ||
+            !epochMatches(event.epochId) ||
+            !memberMatches(event.memberId) ||
+            !classificationMatches(event.memberId)
+        ) {
+            remainingEvents.push(event);
+            return;
+        }
+
+        const entries = Object.entries(event.changes || {});
+        if (!entries.length) {
+            if (!hasMagnitude && !hasBreakpoint) {
+                eventCount++;
+                return;
+            }
+            remainingEvents.push(event);
+            return;
+        }
+
+        const retainedChanges = {};
+        entries.forEach(([stat, change]) => {
+            if (changeMatches(change)) changeCount++;
+            else retainedChanges[stat] = change;
+        });
+        if (Object.keys(retainedChanges).length) {
+            remainingEvents.push({ ...event, changes: retainedChanges });
+        } else {
+            eventCount++;
+        }
+    });
+
+    let snapshotCount = 0;
+    let epochCount = 0;
+    const remainingEpochs = [];
+    data.epochs.forEach(epoch => {
+        if (!groupMatches(epoch.group) || !epochMatches(epoch.id) || hasMagnitude || hasBreakpoint) {
+            remainingEpochs.push(epoch);
+            return;
+        }
+
+        const clone = { ...epoch, baseline: { ...(epoch.baseline || {}) }, latest: { ...(epoch.latest || {}) } };
+        ['baseline', 'latest'].forEach(snapshotType => {
+            Object.entries(clone[snapshotType]).forEach(([memberId, member]) => {
+                if (memberMatches(memberId) && classificationMatches(memberId)) {
+                    delete clone[snapshotType][memberId];
+                    snapshotCount++;
+                }
+            });
+        });
+
+        if (!Object.keys(clone.baseline).length && !Object.keys(clone.latest).length) {
+            epochCount++;
+        } else {
+            remainingEpochs.push(clone);
+        }
+    });
+
+    let visitCount = 0;
+    const mayDeleteVisits = !filters.memberId && !filters.classification && !hasMagnitude && !hasBreakpoint;
+    const remainingVisits = data.visits.filter(visit => {
+        const remove = mayDeleteVisits && groupMatches(visit.group) && epochMatches(visit.epochId);
+        if (remove) visitCount++;
+        return !remove;
+    });
+
+    let catalogCount = 0;
+    if (!filters.group && !filters.epoch && !hasMagnitude && !hasBreakpoint) {
+        Object.entries(data.catalog.members).forEach(([memberId, member]) => {
+            if (memberMatches(memberId) && classificationMatches(memberId)) {
+                catalogCount++;
+                if (commit) {
+                    delete data.catalog.members[memberId];
+                    delete data.settings.exceptions[memberId];
+                }
+            }
+        });
+    }
+
+    const total = eventCount + changeCount + snapshotCount + epochCount + visitCount + catalogCount;
+    if (commit && total) {
+        data.events = remainingEvents;
+        data.epochs = remainingEpochs;
+        data.visits = remainingVisits;
+        HWGT_saveMemberTrackerData(data);
+    }
+
+    return { total, eventCount, changeCount, snapshotCount, epochCount, visitCount, catalogCount };
+}
 
 function HWGT_loadModuleStates() {
     try {
@@ -377,6 +1038,159 @@ function HWGT_setModuleEnabled(id, enabled) {
             color: #777;
             font-size: 10px;
         }
+        #hwgt-preferences-panel .hwgt-tracker-module {
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            background: #fff;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-heading {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            font-weight: bold;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-heading input {
+            margin: 0;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-heading .hwgt-module-name {
+            flex: 1 1 auto;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-help {
+            margin: 6px 0 8px 22px;
+            color: #666;
+            font-size: 10px;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-body[hidden] {
+            display: none;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-groups {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 6px;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-section,
+        #hwgt-preferences-panel .hwgt-tracker-group {
+            border: 1px solid #d2d2d2;
+            border-radius: 3px;
+            background: #fafafa;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-section {
+            margin-top: 7px;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-section > summary,
+        #hwgt-preferences-panel .hwgt-tracker-group > summary {
+            padding: 5px 6px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-group-title {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-group-reset {
+            float: right;
+            margin: -1px 0 0 6px;
+            padding: 0 2px;
+            border: 0;
+            background: transparent;
+            color: #666;
+            font: 11px Arial, sans-serif;
+            cursor: pointer;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-group-reset:hover {
+            color: #111;
+        }
+        #hwgt-preferences-panel .hwgt-schedule-summary {
+            display: block;
+            margin: 0 5px 5px;
+            color: #777;
+            font-size: 9px;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-muted {
+            opacity: .42;
+            filter: grayscale(1);
+        }
+        #hwgt-preferences-panel .hwgt-tracker-fields {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 5px;
+            padding: 0 6px 7px;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-fields label,
+        #hwgt-preferences-panel .hwgt-export-fields label,
+        #hwgt-preferences-panel .hwgt-destroy-fields label {
+            display: grid;
+            gap: 2px;
+            min-width: 0;
+            color: #555;
+            font-size: 9px;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-fields input,
+        #hwgt-preferences-panel .hwgt-tracker-fields select,
+        #hwgt-preferences-panel .hwgt-export-fields select,
+        #hwgt-preferences-panel .hwgt-destroy-fields input,
+        #hwgt-preferences-panel .hwgt-destroy-fields select {
+            width: 100%;
+            min-width: 0;
+            box-sizing: border-box;
+            font: 11px Arial, sans-serif;
+        }
+        #hwgt-preferences-panel .hwgt-tracker-wide {
+            grid-column: 1 / -1;
+        }
+        #hwgt-preferences-panel .hwgt-exception-wrap {
+            max-height: 170px;
+            overflow: auto;
+            padding: 0 6px 6px;
+        }
+        #hwgt-preferences-panel .hwgt-exception-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 10px;
+        }
+        #hwgt-preferences-panel .hwgt-exception-table th,
+        #hwgt-preferences-panel .hwgt-exception-table td {
+            padding: 2px 3px;
+            border-bottom: 1px solid #ddd;
+            text-align: center;
+        }
+        #hwgt-preferences-panel .hwgt-exception-table th:first-child,
+        #hwgt-preferences-panel .hwgt-exception-table td:first-child {
+            text-align: left;
+        }
+        #hwgt-preferences-panel .hwgt-export-fields,
+        #hwgt-preferences-panel .hwgt-destroy-fields {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 5px;
+            padding: 0 6px 7px;
+        }
+        #hwgt-preferences-panel .hwgt-button-row {
+            display: flex;
+            justify-content: flex-end;
+            gap: 5px;
+            grid-column: 1 / -1;
+        }
+        #hwgt-preferences-panel .hwgt-button-row button {
+            padding: 3px 7px;
+            cursor: pointer;
+        }
+        #hwgt-preferences-panel .hwgt-destroy-button {
+            color: #8b0000;
+        }
+        #hwgt-preferences-panel .hwgt-storage-summary {
+            margin-right: 6px;
+            color: #777;
+            font-size: 9px;
+            font-weight: normal;
+        }
+        @media (max-width: 820px) {
+            #hwgt-preferences-panel .hwgt-tracker-groups {
+                grid-template-columns: 1fr;
+            }
+        }
     `;
     document.head.appendChild(style);
 
@@ -402,7 +1216,540 @@ function HWGT_setModuleEnabled(id, enabled) {
     const moduleList = document.createElement('div');
     moduleList.className = 'hwgt-module-list';
 
+    const optionSelect = (options, value) => {
+        const select = document.createElement('select');
+        options.forEach(([optionValue, optionLabel]) => {
+            const option = document.createElement('option');
+            option.value = optionValue;
+            option.textContent = optionLabel;
+            option.selected = String(optionValue) === String(value);
+            select.appendChild(option);
+        });
+        return select;
+    };
+
+    const field = (caption, control, className = '') => {
+        const label = document.createElement('label');
+        if (className) label.className = className;
+        const span = document.createElement('span');
+        span.textContent = caption;
+        label.append(span, control);
+        return label;
+    };
+
+    const setSelectValue = (select, value) => {
+        const wanted = String(value);
+        Array.from(select.options).forEach(option => {
+            option.toggleAttribute('selected', option.value === wanted);
+        });
+        try {
+            select.value = wanted;
+        } catch (_) {
+            // The selected option attributes above remain authoritative.
+        }
+    };
+
+    const renderMemberTrackerModule = (labelText, componentVersion) => {
+        let trackerData = HWGT_loadMemberTrackerData();
+        const card = document.createElement('section');
+        card.className = 'hwgt-tracker-module';
+
+        const heading = document.createElement('div');
+        heading.className = 'hwgt-tracker-heading';
+        const master = document.createElement('input');
+        master.type = 'checkbox';
+        master.checked = HWGT_isModuleEnabled('member-stats');
+        const name = document.createElement('span');
+        name.className = 'hwgt-module-name';
+        name.textContent = labelText;
+        const versionLabel = document.createElement('span');
+        versionLabel.className = 'hwgt-module-version';
+        versionLabel.textContent = componentVersion;
+        heading.append(master, name, versionLabel);
+
+        const help = document.createElement('div');
+        help.className = 'hwgt-tracker-help';
+        help.textContent = 'Choose what to track and configure each group\u2019s reset window and retention.';
+
+        const body = document.createElement('div');
+        body.className = 'hwgt-tracker-body';
+        body.hidden = !master.checked;
+        master.addEventListener('change', () => {
+            HWGT_setModuleEnabled('member-stats', master.checked);
+            body.hidden = !master.checked;
+        });
+
+        const groups = document.createElement('div');
+        groups.className = 'hwgt-tracker-groups';
+        const exceptionCheckboxes = [];
+
+        const scheduleSummary = schedule => {
+            const time = schedule.time || '00:00';
+            if (schedule.frequency === 'daily') return `Daily at ${time}`;
+            if (schedule.frequency === 'weekly') {
+                const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][Number(schedule.weekday) || 0];
+                return `Weekly \u00b7 ${day} ${time}`;
+            }
+            if (schedule.frequency === 'monthly') return `Monthly \u00b7 day ${schedule.monthDay || 1} at ${time}`;
+            const interval = schedule.frequency === 'biweekly' ? 14 : schedule.intervalDays;
+            return `Every ${interval} days \u00b7 ${time}`;
+        };
+
+        const refreshExceptionChecks = () => {
+            exceptionCheckboxes.forEach(checkbox => {
+                checkbox.checked = HWGT_memberIsExcepted(
+                    trackerData.settings,
+                    checkbox.dataset.memberId,
+                    checkbox.dataset.group
+                );
+            });
+        };
+
+        Object.entries(HWGT_MEMBER_GROUPS).forEach(([groupId, definition]) => {
+            const groupSettings = trackerData.settings.groups[groupId];
+            const details = document.createElement('details');
+            details.className = 'hwgt-tracker-group';
+            const summary = document.createElement('summary');
+            const titleWrap = document.createElement('span');
+            titleWrap.className = 'hwgt-tracker-group-title';
+            const enabled = document.createElement('input');
+            enabled.type = 'checkbox';
+            enabled.checked = groupSettings.enabled;
+            enabled.addEventListener('click', event => event.stopPropagation());
+            const titleText = document.createElement('span');
+            titleText.textContent = definition.label;
+            titleWrap.append(enabled, titleText);
+            const resetGroup = document.createElement('button');
+            resetGroup.type = 'button';
+            resetGroup.className = 'hwgt-tracker-group-reset';
+            resetGroup.textContent = '[↻]';
+            resetGroup.title = "Reset This Group's Snapshot Window Settings";
+            resetGroup.setAttribute('aria-label', resetGroup.title);
+            summary.append(titleWrap, resetGroup);
+
+            const summaryLine = document.createElement('span');
+            summaryLine.className = 'hwgt-schedule-summary';
+            summaryLine.textContent = scheduleSummary(groupSettings.schedule);
+
+            const fields = document.createElement('div');
+            fields.className = 'hwgt-tracker-fields';
+            const frequency = optionSelect([
+                ['daily', 'Daily'],
+                ['weekly', 'Weekly'],
+                ['biweekly', 'Biweekly'],
+                ['monthly', 'Monthly'],
+                ['interval', 'Every N days']
+            ], groupSettings.schedule.frequency);
+            const weekday = optionSelect([
+                ['0', 'Sunday'], ['1', 'Monday'], ['2', 'Tuesday'], ['3', 'Wednesday'],
+                ['4', 'Thursday'], ['5', 'Friday'], ['6', 'Saturday']
+            ], groupSettings.schedule.weekday);
+            const monthDay = document.createElement('input');
+            monthDay.type = 'number';
+            monthDay.min = '1';
+            monthDay.max = '31';
+            monthDay.value = groupSettings.schedule.monthDay;
+            const intervalDays = document.createElement('input');
+            intervalDays.type = 'number';
+            intervalDays.min = '1';
+            intervalDays.max = '3650';
+            intervalDays.value = groupSettings.schedule.intervalDays;
+            const anchorDate = document.createElement('input');
+            anchorDate.type = 'text';
+            anchorDate.inputMode = 'numeric';
+            anchorDate.maxLength = 5;
+            anchorDate.placeholder = 'MM/DD';
+            anchorDate.pattern = '\\d{1,2}/\\d{1,2}';
+            anchorDate.style.width = '7ch';
+            anchorDate.value = HWGT_compactAnchorDate(groupSettings.schedule.anchorDate);
+            anchorDate.title = 'Month and day. The applicable year is retained internally and included in exports.';
+            const time = document.createElement('input');
+            time.type = 'time';
+            time.value = groupSettings.schedule.time;
+            const timezone = optionSelect([
+                ['local', 'Local Time'],
+                ['server', 'Server Time']
+            ], groupSettings.schedule.timezone);
+            timezone.title = 'Server Time uses Australia/Brisbane (AEST, UTC+10).';
+            const retentionValue = document.createElement('input');
+            retentionValue.type = 'number';
+            retentionValue.min = '1';
+            retentionValue.max = '24';
+            retentionValue.value = groupSettings.retention.value;
+            const retentionUnit = optionSelect([
+                ['days', 'days'], ['weeks', 'weeks'], ['months', 'months']
+            ], groupSettings.retention.unit);
+
+            const frequencyField = field('Reset Frequency', frequency);
+            const weekdayField = field('Reset Weekday', weekday);
+            const monthDayField = field('Day of Month', monthDay);
+            const intervalField = field('Interval Days', intervalDays);
+            const anchorField = field('Anchor Date', anchorDate);
+            const timeField = field('Epoch Boundary', time);
+            const timezoneField = field('Time Zone', timezone);
+            const retentionField = document.createElement('label');
+            retentionField.className = 'hwgt-tracker-wide';
+            const retentionCaption = document.createElement('span');
+            retentionCaption.textContent = 'Retain Records For';
+            const retentionControls = document.createElement('span');
+            retentionControls.style.display = 'grid';
+            retentionControls.style.gridTemplateColumns = '1fr 1fr';
+            retentionControls.style.gap = '4px';
+            retentionControls.append(retentionValue, retentionUnit);
+            retentionField.append(retentionCaption, retentionControls);
+            fields.append(
+                anchorField, timeField, frequencyField, intervalField,
+                weekdayField, monthDayField, timezoneField, retentionField
+            );
+
+            const setFieldActive = (fieldElement, active) => {
+                fieldElement.classList.toggle('hwgt-tracker-muted', !active);
+                fieldElement.querySelectorAll('input, select').forEach(control => {
+                    control.style.pointerEvents = active ? '' : 'none';
+                    control.tabIndex = active ? 0 : -1;
+                    control.setAttribute('aria-disabled', String(!active));
+                });
+            };
+            const syncRetentionLimits = () => {
+                const maxima = { days: 7, weeks: 52, months: 24 };
+                const maximum = maxima[retentionUnit.value] || 24;
+                retentionValue.min = '1';
+                retentionValue.max = String(maximum);
+                retentionValue.value = String(Math.min(maximum, Math.max(1, Number(retentionValue.value) || 1)));
+            };
+            const syncConditionalFields = () => {
+                const selected = frequency.value;
+                const categoryEnabled = enabled.checked;
+                const activeFields = new Set(['frequency', 'time', 'timezone', 'retention']);
+                if (selected === 'weekly') activeFields.add('weekday');
+                if (selected === 'monthly') activeFields.add('monthDay');
+                if (selected === 'biweekly') activeFields.add('anchor');
+                if (selected === 'interval') {
+                    activeFields.add('interval');
+                    activeFields.add('anchor');
+                }
+                const fieldMap = {
+                    frequency: frequencyField, weekday: weekdayField,
+                    monthDay: monthDayField, interval: intervalField,
+                    anchor: anchorField, time: timeField,
+                    timezone: timezoneField, retention: retentionField
+                };
+                Object.entries(fieldMap).forEach(([id, fieldElement]) => {
+                    setFieldActive(fieldElement, categoryEnabled && activeFields.has(id));
+                });
+                summaryLine.classList.toggle('hwgt-tracker-muted', !categoryEnabled);
+            };
+
+            const saveGroup = () => {
+                syncRetentionLimits();
+                const resolvedAnchor = HWGT_resolveAnchorDate(
+                    anchorDate.value,
+                    groupSettings.schedule.anchorDate,
+                    { ...groupSettings.schedule, timezone: timezone.value }
+                );
+                anchorDate.value = HWGT_compactAnchorDate(resolvedAnchor);
+                groupSettings.enabled = enabled.checked;
+                groupSettings.schedule = {
+                    frequency: frequency.value,
+                    weekday: Number(weekday.value),
+                    monthDay: Math.min(31, Math.max(1, Number(monthDay.value) || 1)),
+                    intervalDays: Math.min(3650, Math.max(1, Number(intervalDays.value) || 1)),
+                    anchorDate: resolvedAnchor || groupSettings.schedule.anchorDate,
+                    time: time.value || '00:00',
+                    timezone: timezone.value
+                };
+                groupSettings.retention = {
+                    value: Number(retentionValue.value),
+                    unit: retentionUnit.value
+                };
+                trackerData.settings.groups[groupId] = groupSettings;
+                HWGT_saveMemberTrackerData(trackerData);
+                summaryLine.textContent = scheduleSummary(groupSettings.schedule);
+                syncConditionalFields();
+                refreshExceptionChecks();
+            };
+
+            resetGroup.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!confirm(`Reset the ${definition.label} group's snapshot window settings?`)) return;
+                const defaultGroup = HWGT_defaultMemberTrackerSettings().groups[groupId];
+                groupSettings.schedule = { ...defaultGroup.schedule };
+                groupSettings.retention = { ...defaultGroup.retention };
+                setSelectValue(frequency, groupSettings.schedule.frequency);
+                setSelectValue(weekday, groupSettings.schedule.weekday);
+                monthDay.value = String(groupSettings.schedule.monthDay);
+                intervalDays.value = String(groupSettings.schedule.intervalDays);
+                anchorDate.value = HWGT_compactAnchorDate(groupSettings.schedule.anchorDate);
+                time.value = groupSettings.schedule.time;
+                setSelectValue(timezone, groupSettings.schedule.timezone);
+                retentionValue.value = String(groupSettings.retention.value);
+                setSelectValue(retentionUnit, groupSettings.retention.unit);
+                trackerData.settings.groups[groupId] = groupSettings;
+                HWGT_saveMemberTrackerData(trackerData);
+                summaryLine.textContent = scheduleSummary(groupSettings.schedule);
+                syncRetentionLimits();
+                syncConditionalFields();
+                refreshExceptionChecks();
+            });
+
+            [enabled, frequency, weekday, monthDay, intervalDays, anchorDate, time, timezone, retentionValue, retentionUnit]
+                .forEach(control => control.addEventListener('change', saveGroup));
+            syncRetentionLimits();
+            syncConditionalFields();
+            details.append(summary, summaryLine, fields);
+            groups.appendChild(details);
+        });
+
+        const exceptions = document.createElement('details');
+        exceptions.className = 'hwgt-tracker-section';
+        const exceptionsSummary = document.createElement('summary');
+        exceptionsSummary.textContent = 'Per-Hobo Exceptions';
+        const exceptionWrap = document.createElement('div');
+        exceptionWrap.className = 'hwgt-exception-wrap';
+        const knownCatalogMembers = Object.entries(trackerData.catalog.members)
+            .sort((a, b) => String(a[1].name || '').localeCompare(String(b[1].name || '')));
+        const knownMembers = knownCatalogMembers.filter(([, member]) =>
+            Number.isFinite(Number(member.classificationCapturedAt?.membersList))
+        );
+        if (!knownMembers.length) {
+            exceptionWrap.textContent = 'Visit the Members List once to populate member controls.';
+        } else {
+            const table = document.createElement('table');
+            table.className = 'hwgt-exception-table';
+            const head = document.createElement('thead');
+            const headRow = document.createElement('tr');
+            ['Hobo', ...Object.values(HWGT_MEMBER_GROUPS).map(group => group.label)]
+                .forEach(text => {
+                    const th = document.createElement('th');
+                    th.textContent = text;
+                    headRow.appendChild(th);
+                });
+            head.appendChild(headRow);
+            const tbody = document.createElement('tbody');
+            knownMembers.forEach(([memberId, member]) => {
+                const row = document.createElement('tr');
+                const memberCell = document.createElement('td');
+                memberCell.textContent = `${member.name || `#${memberId}`}${member.membershipState === 'former' ? ' (former)' : ''}`;
+                row.appendChild(memberCell);
+                Object.keys(HWGT_MEMBER_GROUPS).forEach(groupId => {
+                    const cell = document.createElement('td');
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.dataset.memberId = memberId;
+                    checkbox.dataset.group = groupId;
+                    checkbox.title = 'Checked means this hobo uses exception handling for this category.';
+                    checkbox.checked = HWGT_memberIsExcepted(trackerData.settings, memberId, groupId);
+                    exceptionCheckboxes.push(checkbox);
+                    checkbox.addEventListener('change', () => {
+                        if (!trackerData.settings.exceptions[memberId]) {
+                            trackerData.settings.exceptions[memberId] = {};
+                        }
+                        if (checkbox.checked) {
+                            trackerData.settings.exceptions[memberId][groupId] = true;
+                        } else {
+                            delete trackerData.settings.exceptions[memberId][groupId];
+                        }
+                        if (!Object.keys(trackerData.settings.exceptions[memberId]).length) {
+                            delete trackerData.settings.exceptions[memberId];
+                        }
+                        HWGT_saveMemberTrackerData(trackerData);
+                    });
+                    cell.appendChild(checkbox);
+                    row.appendChild(cell);
+                });
+                tbody.appendChild(row);
+            });
+            table.append(head, tbody);
+            exceptionWrap.appendChild(table);
+        }
+        exceptions.append(exceptionsSummary, exceptionWrap);
+
+        const exportSection = document.createElement('details');
+        exportSection.className = 'hwgt-tracker-section';
+        const exportSummary = document.createElement('summary');
+        exportSummary.textContent = 'Copy / Export Data';
+        const exportFields = document.createElement('div');
+        exportFields.className = 'hwgt-export-fields';
+        const format = optionSelect([
+            ['text', 'Plain Text'], ['markdown', 'Markdown'], ['json', 'JSON']
+        ], trackerData.settings.export.format);
+        const exportButtons = document.createElement('div');
+        exportButtons.className = 'hwgt-button-row';
+        const copy = document.createElement('button');
+        copy.type = 'button';
+        copy.textContent = 'Copy';
+        const download = document.createElement('button');
+        download.type = 'button';
+        download.textContent = 'Download';
+        const saveExportSettings = () => {
+            trackerData.settings.export = { format: format.value };
+            HWGT_saveMemberTrackerData(trackerData);
+        };
+        format.addEventListener('change', saveExportSettings);
+        const buildExport = () => {
+            saveExportSettings();
+            return HWGT_buildMemberTrackerExport(trackerData, format.value);
+        };
+        copy.addEventListener('click', async () => {
+            const output = buildExport();
+            try {
+                await navigator.clipboard.writeText(output.text);
+            } catch (_) {
+                const textarea = document.createElement('textarea');
+                textarea.value = output.text;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                textarea.remove();
+            }
+            copy.textContent = '\u2713 Copied';
+            setTimeout(() => { copy.textContent = 'Copy'; }, 900);
+        });
+        download.addEventListener('click', () => {
+            const output = buildExport();
+            const blob = new Blob([output.text], { type: `${output.mime};charset=utf-8` });
+            const href = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = href;
+            anchor.download = `HW Gang Member Stats ${new Date().toISOString().slice(0, 10)}.${output.extension}`;
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+            setTimeout(() => URL.revokeObjectURL(href), 0);
+        });
+        exportButtons.append(copy, download);
+        exportFields.append(field('Format', format, 'hwgt-tracker-wide'), exportButtons);
+        exportSection.append(exportSummary, exportFields);
+
+        const destroySection = document.createElement('details');
+        destroySection.className = 'hwgt-tracker-section';
+        const destroySummary = document.createElement('summary');
+        destroySummary.textContent = 'Deletion Handling';
+        const storageSummary = document.createElement('span');
+        storageSummary.className = 'hwgt-storage-summary';
+        storageSummary.textContent = ` ${trackerData.epochs.length} epochs \u00b7 ${trackerData.events.length} events`;
+        destroySummary.appendChild(storageSummary);
+        const destroyFields = document.createElement('div');
+        destroyFields.className = 'hwgt-destroy-fields';
+        const memberFilter = optionSelect([
+            ['', 'All hobos'],
+            ...knownCatalogMembers.map(([memberId, member]) => [memberId, `${member.name || `#${memberId}`} (#${memberId})`])
+        ], '');
+        const groupFilter = optionSelect([
+            ['', 'All groups'],
+            ...Object.entries(HWGT_MEMBER_GROUPS).map(([id, group]) => [id, group.label])
+        ], '');
+        const epochFilter = optionSelect([
+            ['', 'All epochs'],
+            ...trackerData.epochs
+                .slice()
+                .sort((a, b) => b.boundaryAt - a.boundaryAt)
+                .map(epoch => [epoch.id, `${HWGT_MEMBER_GROUPS[epoch.group]?.label || epoch.group} \u00b7 ${new Date(epoch.boundaryAt).toLocaleString()}`])
+        ], '');
+        const refreshEpochFilter = () => {
+            const selected = epochFilter.value;
+            const choices = trackerData.epochs
+                .filter(epoch => !groupFilter.value || epoch.group === groupFilter.value)
+                .slice()
+                .sort((a, b) => b.boundaryAt - a.boundaryAt);
+            epochFilter.replaceChildren();
+            const all = document.createElement('option');
+            all.value = '';
+            all.textContent = 'All epochs';
+            epochFilter.appendChild(all);
+            choices.forEach(epoch => {
+                const option = document.createElement('option');
+                option.value = epoch.id;
+                option.textContent = `${HWGT_MEMBER_GROUPS[epoch.group]?.label || epoch.group} \u00b7 ${new Date(epoch.boundaryAt).toLocaleString()}`;
+                epochFilter.appendChild(option);
+            });
+            epochFilter.value = choices.some(epoch => epoch.id === selected) ? selected : '';
+        };
+        groupFilter.addEventListener('change', refreshEpochFilter);
+        const classificationFilter = optionSelect([
+            ['', 'Any member classification'],
+            ...Object.entries(HWGT_MEMBER_CLASSIFICATIONS)
+        ], '');
+        const minMagnitude = document.createElement('input');
+        minMagnitude.type = 'number';
+        minMagnitude.min = '0';
+        minMagnitude.placeholder = 'No minimum';
+        const maxMagnitude = document.createElement('input');
+        maxMagnitude.type = 'number';
+        maxMagnitude.min = '0';
+        maxMagnitude.placeholder = 'No maximum';
+        const breakpoint = document.createElement('input');
+        breakpoint.type = 'number';
+        breakpoint.min = '1';
+        breakpoint.placeholder = 'Disabled';
+        breakpoint.title = 'Optionally match changes that crossed a multiple of this value.';
+        const breakpointMode = optionSelect([
+            ['crossed', 'Crossed breakpoint'],
+            ['not-crossed', 'Did not cross']
+        ], 'crossed');
+        breakpointMode.disabled = true;
+        breakpoint.addEventListener('input', () => {
+            breakpointMode.disabled = breakpoint.value === '';
+        });
+        const destroyButtons = document.createElement('div');
+        destroyButtons.className = 'hwgt-button-row';
+        const destroy = document.createElement('button');
+        destroy.type = 'button';
+        destroy.className = 'hwgt-destroy-button';
+        destroy.textContent = 'Delete matching data\u2026';
+        destroy.addEventListener('click', () => {
+            const filters = {
+                memberId: memberFilter.value,
+                group: groupFilter.value,
+                epoch: epochFilter.value,
+                classification: classificationFilter.value,
+                minMagnitude: minMagnitude.value === '' ? NaN : Math.abs(Number(minMagnitude.value)),
+                maxMagnitude: maxMagnitude.value === '' ? NaN : Math.abs(Number(maxMagnitude.value)),
+                breakpoint: breakpoint.value === '' ? NaN : Math.abs(Number(breakpoint.value)),
+                breakpointMode: breakpointMode.value
+            };
+            const preview = HWGT_deleteMemberTrackerData(filters, false);
+            if (!preview.total) {
+                alert('No stored data matches those filters.');
+                return;
+            }
+            const detail = [
+                `${preview.changeCount} stat changes`,
+                `${preview.eventCount} complete events`,
+                `${preview.snapshotCount} snapshot rows`,
+                `${preview.epochCount} empty epochs`,
+                `${preview.visitCount} visit records`,
+                `${preview.catalogCount} member records`
+            ].join(', ');
+            if (!confirm(`Permanently delete the matching tracker data?\n\n${detail}\n\nThis cannot be undone.`)) return;
+            HWGT_deleteMemberTrackerData(filters, true);
+            trackerData = HWGT_loadMemberTrackerData();
+            storageSummary.textContent = ` ${trackerData.epochs.length} epochs \u00b7 ${trackerData.events.length} events`;
+            refreshEpochFilter();
+            alert('The matching tracker data was deleted.');
+        });
+        destroyButtons.appendChild(destroy);
+        destroyFields.append(
+            field('Hobo', memberFilter), field('Stat Page Group', groupFilter),
+            field('Epoch', epochFilter, 'hwgt-tracker-wide'),
+            field('Member Classification', classificationFilter, 'hwgt-tracker-wide'),
+            field('Minimum |\u0394|', minMagnitude), field('Maximum |\u0394|', maxMagnitude),
+            field('Breakpoint Size', breakpoint), field('Breakpoint Test', breakpointMode),
+            destroyButtons
+        );
+        destroySection.append(destroySummary, destroyFields);
+
+        body.append(groups, exceptions, exportSection, destroySection);
+        card.append(heading, help, body);
+        return card;
+    };
+
     for (const [id, labelText, componentVersion] of HWGT_MODULES) {
+        if (id === 'member-stats') {
+            moduleList.appendChild(renderMemberTrackerModule(labelText, componentVersion));
+            continue;
+        }
         const label = document.createElement('label');
         label.className = 'hwgt-module-option';
 
@@ -427,7 +1774,7 @@ function HWGT_setModuleEnabled(id, enabled) {
 
     const note = document.createElement('div');
     note.className = 'hwgt-note';
-    note.textContent = 'Changes apply on the next page load.';
+    note.textContent = 'Component toggles apply on the next page load; tracker settings save immediately.';
 
     panel.append(titleRow, subtitle, moduleList, note);
     content.insertBefore(panel, content.firstChild);
@@ -4403,4 +5750,499 @@ function HWGT_setModuleEnabled(id, enabled) {
     }
 
     injectExporter();
+})();
+
+/* ===== Component 3: Gang Member Stat Tracker v1.2 ===== */
+(function () {
+    'use strict';
+
+    if (!HWGT_isModuleEnabled('member-stats')) return;
+
+    const params = new URLSearchParams(location.search);
+    if (params.get('cmd') !== 'gang' || params.get('do') !== 'list_mem') return;
+
+    const table = document.getElementById('sortabletable');
+    if (!table) return;
+
+    const cleanText = value => String(value || '')
+        .replace(/\u00a0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const parseMembers = () => {
+        const members = {};
+        table.querySelectorAll('tbody tr').forEach(row => {
+            const checkbox = row.querySelector('input.checkMe[name="players[]"]');
+            const profile = row.querySelector('a[href*="cmd=player"][href*="ID="]');
+            const memberId =
+                cleanText(checkbox?.value) ||
+                String(profile?.href.match(/[?&]ID=(\d+)/i)?.[1] || '');
+            if (!memberId) return;
+
+            const member = {
+                id: memberId,
+                name: cleanText(profile?.textContent) || `#${memberId}`,
+                profileUrl: profile?.href || '',
+                groups: {},
+                rawGroups: {},
+                chamberText: ''
+            };
+            Object.entries(HWGT_MEMBER_GROUPS).forEach(([groupId, definition]) => {
+                const values = {};
+                const rawValues = {};
+                Object.entries(definition.stats).forEach(([statId, [className]]) => {
+                    const cell = row.querySelector(`td.${className}`);
+                    const text = cleanText(cell?.textContent);
+                    const numeric = HWGT_parseTrackedNumber(text);
+                    rawValues[statId] = text === '' ? null : text;
+                    values[statId] = text === ''
+                        ? null
+                        : Number.isFinite(numeric)
+                            ? numeric
+                            : text;
+                });
+                member.groups[groupId] = values;
+                member.rawGroups[groupId] = rawValues;
+            });
+            const chamberCell = row.querySelector('td.ts_chamber');
+            member.chamberText = cleanText([
+                chamberCell?.textContent,
+                ...Array.from(chamberCell?.querySelectorAll('[title], img[alt]') || [])
+                    .map(node => node.getAttribute('title') || node.getAttribute('alt') || '')
+            ].join(' '));
+            members[memberId] = member;
+        });
+        return members;
+    };
+
+    const now = Date.now();
+    const members = parseMembers();
+    const memberIds = Object.keys(members);
+    if (!memberIds.length) return;
+
+    const data = HWGT_loadMemberTrackerData();
+    const previousCatalog = { ...data.catalog.members };
+    const hasPriorRoster = Object.keys(previousCatalog).length > 0;
+    const currentIdSet = new Set(memberIds);
+
+    Object.entries(data.catalog.members).forEach(([memberId, member]) => {
+        if (!currentIdSet.has(memberId) && member.membershipState !== 'former') {
+            member.membershipState = 'former';
+            member.leftAt = now;
+        }
+    });
+
+    memberIds.forEach(memberId => {
+        const parsed = members[memberId];
+        const old = previousCatalog[memberId];
+        const arrivalState = !old
+            ? hasPriorRoster ? 'joined' : 'current'
+            : old.membershipState === 'former'
+                ? 'returned'
+                : 'current';
+        data.catalog.members[memberId] = {
+            ...(old || {}),
+            name: parsed.name,
+            profileUrl: parsed.profileUrl || old?.profileUrl || '',
+            membershipState: 'current',
+            classifications: {
+                ...(old?.classifications || {}),
+                warChamber: /(?:^|\b)WC(?:\b|$)|WAR\s+CHAMBER/i.test(parsed.chamberText),
+                juniorWarChamber: /(?:^|\b)JWC(?:\b|$)|JUNIOR\s+WAR\s+CHAMBER/i.test(parsed.chamberText),
+                active: Number(parsed.groups.main.lastActive) <= 43_200,
+                inactive: Number(parsed.groups.main.lastActive) > 43_200
+            },
+            firstSeenAt: old?.firstSeenAt || now,
+            lastSeenAt: now,
+            lastArrivalState: arrivalState,
+            classificationCapturedAt: {
+                ...(old?.classificationCapturedAt || {}),
+                membersList: now
+            }
+        };
+        delete data.catalog.members[memberId].leftAt;
+    });
+    data.sources = { ...(data.sources || {}), membersListCapturedAt: now };
+
+    Object.entries(HWGT_MEMBER_GROUPS).forEach(([groupId]) => {
+        const groupSettings = data.settings.groups[groupId];
+        const boundaryAt = HWGT_scheduleBoundary(groupSettings.schedule, now);
+        const epochId = `${groupId}:${boundaryAt}`;
+        let epoch = data.epochs.find(item => item.id === epochId);
+        const trackedMembers = Object.fromEntries(
+            memberIds
+                .filter(memberId => HWGT_effectiveMemberTracking(data.settings, memberId, groupId))
+                .map(memberId => [memberId, members[memberId]])
+        );
+        if (!Object.keys(trackedMembers).length) return;
+
+        if (!epoch) {
+            const baseline = {};
+            Object.entries(trackedMembers).forEach(([memberId, member]) => {
+                baseline[memberId] = {
+                    name: member.name,
+                    membershipState: data.catalog.members[memberId].lastArrivalState || 'current',
+                    capturedAt: now,
+                    values: { ...member.groups[groupId] },
+                    rawValues: { ...member.rawGroups[groupId] }
+                };
+            });
+            epoch = {
+                id: epochId,
+                group: groupId,
+                boundaryAt,
+                firstCapturedAt: now,
+                lastCapturedAt: now,
+                visitCount: 1,
+                baseline,
+                latest: JSON.parse(JSON.stringify(baseline))
+            };
+            data.epochs.push(epoch);
+        } else {
+            epoch.visitCount = (Number(epoch.visitCount) || 0) + 1;
+            epoch.lastCapturedAt = now;
+            const latest = epoch.latest || (epoch.latest = {});
+
+            Object.entries(trackedMembers).forEach(([memberId, member]) => {
+                const currentValues = member.groups[groupId];
+                const currentRawValues = member.rawGroups[groupId];
+                const previous = latest[memberId];
+                const membershipState = !previous
+                    ? data.catalog.members[memberId].lastArrivalState || 'joined'
+                    : previous.membershipState === 'left'
+                        ? 'returned'
+                        : 'current';
+                const changes = {};
+
+                if (previous) {
+                    Object.entries(currentRawValues).forEach(([statId, currentRaw]) => {
+                        const previousRaw = HWGT_snapshotRaw(previous, statId);
+                        if (previousRaw === currentRaw) return;
+                        const from = previous.values?.[statId] ?? HWGT_parseTrackedNumber(previousRaw);
+                        const to = currentValues[statId] ?? HWGT_parseTrackedNumber(currentRaw);
+                        const baselineRaw = HWGT_snapshotRaw(epoch.baseline?.[memberId], statId);
+                        const baselineValue = HWGT_parseTrackedNumber(baselineRaw);
+                        changes[statId] = {
+                            from: previousRaw,
+                            to: currentRaw,
+                            fromRaw: previousRaw,
+                            toRaw: currentRaw,
+                            fromNumeric: Number.isFinite(from) ? from : null,
+                            toNumeric: Number.isFinite(to) ? to : null,
+                            delta: Number.isFinite(from) && Number.isFinite(to) ? to - from : null,
+                            epochDelta: Number.isFinite(baselineValue) && Number.isFinite(to)
+                                ? to - baselineValue
+                                : null
+                        };
+                    });
+                } else {
+                    Object.entries(currentRawValues).forEach(([statId, currentRaw]) => {
+                        const currentNumeric = currentValues[statId];
+                        changes[statId] = {
+                            from: null,
+                            to: currentRaw,
+                            fromRaw: null,
+                            toRaw: currentRaw,
+                            fromNumeric: null,
+                            toNumeric: Number.isFinite(currentNumeric) ? currentNumeric : null,
+                            delta: null,
+                            epochDelta: null
+                        };
+                    });
+                }
+
+                if (Object.keys(changes).length || membershipState !== 'current') {
+                    data.events.push({
+                        id: `${now}:${groupId}:${memberId}`,
+                        at: now,
+                        group: groupId,
+                        epochId,
+                        memberId,
+                        name: member.name,
+                        membershipState,
+                        changes
+                    });
+                }
+
+                latest[memberId] = {
+                    name: member.name,
+                    membershipState: 'current',
+                    capturedAt: now,
+                    values: { ...currentValues },
+                    rawValues: { ...currentRawValues }
+                };
+                if (!epoch.baseline?.[memberId]) {
+                    epoch.baseline[memberId] = {
+                        name: member.name,
+                        membershipState,
+                        capturedAt: now,
+                        values: { ...currentValues },
+                        rawValues: { ...currentRawValues }
+                    };
+                }
+            });
+
+            Object.entries(latest).forEach(([memberId, previous]) => {
+                if (currentIdSet.has(memberId) || previous.membershipState === 'left') return;
+                data.events.push({
+                    id: `${now}:${groupId}:${memberId}:left`,
+                    at: now,
+                    group: groupId,
+                    epochId,
+                    memberId,
+                    name: previous.name || data.catalog.members[memberId]?.name || `#${memberId}`,
+                    membershipState: 'left',
+                    changes: {}
+                });
+                latest[memberId] = { ...previous, membershipState: 'left', capturedAt: now };
+            });
+        }
+
+        const changedEvents = data.events.filter(event => event.at === now && event.group === groupId);
+        data.visits.push({
+            id: `${now}:${groupId}`,
+            at: now,
+            group: groupId,
+            epochId,
+            memberCount: Object.keys(trackedMembers).length,
+            changedMemberCount: changedEvents.length
+        });
+
+        const cutoff = now - HWGT_retentionMilliseconds(groupSettings.retention);
+        const newestBoundary = Math.max(
+            ...data.epochs.filter(item => item.group === groupId).map(item => item.boundaryAt)
+        );
+        const retainedEpochIds = new Set(
+            data.epochs
+                .filter(item => item.group !== groupId || item.lastCapturedAt >= cutoff || item.boundaryAt === newestBoundary)
+                .map(item => item.id)
+        );
+        data.epochs = data.epochs.filter(item => retainedEpochIds.has(item.id));
+        data.events = data.events.filter(event => event.group !== groupId || (event.at >= cutoff && retainedEpochIds.has(event.epochId)));
+        data.visits = data.visits.filter(visit => visit.group !== groupId || (visit.at >= cutoff && retainedEpochIds.has(visit.epochId)));
+    });
+
+    // Keep GILA's incentive verifier supplied with the newest relevant values.
+    const compatibilityMembers = {};
+    Object.entries(members).forEach(([memberId, member]) => {
+        compatibilityMembers[memberId] = {
+            level: HWGT_parseTrackedNumber(member.groups.main.level),
+            begging: HWGT_parseTrackedNumber(member.groups.other.begging),
+            intelligence: HWGT_parseTrackedNumber(member.groups.other.intelligence),
+            drinking: HWGT_parseTrackedNumber(member.groups.other.drinking),
+            mining: HWGT_parseTrackedNumber(member.groups.other.mining)
+        };
+    });
+    localStorage.setItem('hwgt_gila_member_stats_v1', JSON.stringify({
+        schema: 1,
+        capturedAt: now,
+        members: compatibilityMembers
+    }));
+
+    HWGT_saveMemberTrackerData(data);
+
+    const groupByNavClass = {
+        show1: 'main',
+        show2: 'battle',
+        show3: 'other',
+        show4: 'hall'
+    };
+    const navItems = Array.from(document.querySelectorAll('a.nav.show1, a.nav.show2, a.nav.show3, a.nav.show4'));
+    const activeGroup = () => {
+        const active = navItems.find(item =>
+            item.style.fontWeight === 'bold' || getComputedStyle(item).fontWeight === '700'
+        );
+        const navClass = active
+            ? Object.keys(groupByNavClass).find(className => active.classList.contains(className))
+            : 'show1';
+        return groupByNavClass[navClass] || 'main';
+    };
+    const memberCheckboxes = new Map();
+    const headerRow = table.querySelector('thead tr');
+    if (headerRow && !headerRow.querySelector('.hwgt-member-exception-heading')) {
+        const heading = document.createElement('th');
+        heading.className = 'hwgt-member-exception-heading';
+        heading.textContent = '[ \u0394 ]';
+        heading.title = 'Check a box to denote that member as an exception for tracker handling.';
+        headerRow.appendChild(heading);
+    }
+
+    table.querySelectorAll('tbody tr').forEach(row => {
+        const nativeCheckbox = row.querySelector('input.checkMe[name="players[]"]');
+        const profile = row.querySelector('a[href*="cmd=player"][href*="ID="]');
+        const memberId = cleanText(nativeCheckbox?.value) ||
+            String(profile?.href.match(/[?&]ID=(\d+)/i)?.[1] || '');
+        if (!memberId || row.querySelector('.hwgt-member-exception-cell')) return;
+        const cell = document.createElement('td');
+        cell.className = 'hwgt-member-exception-cell';
+        cell.style.textAlign = 'center';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.title = 'Check to use exception handling for this member in the displayed category.';
+        checkbox.addEventListener('change', () => {
+            const groupId = activeGroup();
+            if (!data.settings.exceptions[memberId]) data.settings.exceptions[memberId] = {};
+            if (checkbox.checked) data.settings.exceptions[memberId][groupId] = true;
+            else delete data.settings.exceptions[memberId][groupId];
+            if (!Object.keys(data.settings.exceptions[memberId]).length) {
+                delete data.settings.exceptions[memberId];
+            }
+            HWGT_saveMemberTrackerData(data);
+        });
+        memberCheckboxes.set(memberId, checkbox);
+        cell.appendChild(checkbox);
+        row.appendChild(cell);
+    });
+
+    const syncMemberExceptionColumn = () => {
+        const groupId = activeGroup();
+        memberCheckboxes.forEach((checkbox, memberId) => {
+            checkbox.checked = HWGT_memberIsExcepted(data.settings, memberId, groupId);
+            checkbox.setAttribute(
+                'aria-label',
+                `${members[memberId]?.name || `#${memberId}`} exception for ${HWGT_MEMBER_GROUPS[groupId].label}`
+            );
+        });
+    };
+    navItems.forEach(item => item.addEventListener('click', () => {
+        setTimeout(syncMemberExceptionColumn, 0);
+    }));
+    syncMemberExceptionColumn();
+})();
+
+/* ===== Gang Member Stat Tracker classification sources ===== */
+(function () {
+    'use strict';
+
+    if (!HWGT_isModuleEnabled('member-stats')) return;
+    const params = new URLSearchParams(location.search);
+    if (params.get('cmd') !== 'gang') return;
+
+    const cleanText = value => String(value || '')
+        .replace(/\u00a0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const profileId = anchor => String(anchor?.href.match(/[?&]ID=(\d+)/i)?.[1] || '');
+    const now = Date.now();
+    const data = HWGT_loadMemberTrackerData();
+    let changed = false;
+
+    const whitelistTable = document.querySelector('table#whitelist');
+    if (whitelistTable) {
+        const listed = new Map();
+        whitelistTable.querySelectorAll('tbody tr').forEach(row => {
+            const anchor = row.querySelector('a[href*="cmd=player"][href*="ID="]');
+            const memberId = profileId(anchor);
+            if (!memberId) return;
+            const selectedTitle = row.querySelector('select option:checked, select option[selected]');
+            listed.set(memberId, {
+                name: cleanText(anchor.textContent) || `#${memberId}`,
+                profileUrl: anchor.href || '',
+                title: cleanText(selectedTitle?.textContent).replace(/^-None-$/, '')
+            });
+        });
+
+        Object.values(data.catalog.members).forEach(member => {
+            const classifications = member.classifications || (member.classifications = {});
+            if (classifications.whitelist) classifications.whitelist = false;
+            delete member.whitelistTitle;
+        });
+        listed.forEach((entry, memberId) => {
+            const member = data.catalog.members[memberId] || {};
+            data.catalog.members[memberId] = {
+                ...member,
+                name: entry.name,
+                profileUrl: entry.profileUrl || member.profileUrl || '',
+                classifications: { ...(member.classifications || {}), whitelist: true },
+                whitelistTitle: entry.title,
+                firstSeenAt: member.firstSeenAt || now,
+                classificationCapturedAt: {
+                    ...(member.classificationCapturedAt || {}),
+                    whitelist: now
+                }
+            };
+        });
+        data.sources = { ...(data.sources || {}), whitelistCapturedAt: now };
+        changed = true;
+    }
+
+    const content = document.querySelector('.content-area');
+    const labels = Array.from(content?.querySelectorAll('b, strong') || []);
+    const findLabel = wanted => labels.find(node =>
+        cleanText(node.textContent).replace(/:$/, '').toLowerCase() === wanted.toLowerCase()
+    );
+    const linksAfter = label => {
+        const links = [];
+        let node = label?.nextSibling;
+        while (node && node.nodeName !== 'BR') {
+            if (node.nodeType === 1) {
+                if (node.matches?.('a[href*="cmd=player"][href*="ID="]')) links.push(node);
+                links.push(...Array.from(node.querySelectorAll?.('a[href*="cmd=player"][href*="ID="]') || []));
+            }
+            node = node.nextSibling;
+        }
+        return links;
+    };
+
+    const leaderLabel = findLabel('Leader');
+    const ownerLabel = findLabel('Owner');
+    const councilLabel = findLabel('Leadership Council');
+    const basicInfoLabel = Array.from(content?.querySelectorAll('u') || [])
+        .some(node => cleanText(node.textContent).replace(/:$/, '') === 'Basic Info');
+
+    if (basicInfoLabel && leaderLabel && ownerLabel && councilLabel) {
+        const allLinks = Array.from(content.querySelectorAll('a[href*="cmd=player"][href*="ID="]'));
+        const roster = new Map();
+        allLinks.forEach(anchor => {
+            const memberId = profileId(anchor);
+            if (memberId) roster.set(memberId, {
+                name: cleanText(anchor.textContent) || `#${memberId}`,
+                profileUrl: anchor.href || ''
+            });
+        });
+        const leaders = new Set(linksAfter(leaderLabel).map(profileId).filter(Boolean));
+        const owners = new Set(linksAfter(ownerLabel).map(profileId).filter(Boolean));
+        const council = new Set(linksAfter(councilLabel).map(profileId).filter(Boolean));
+        const staff = new Set([...leaders, ...owners, ...council]);
+
+        Object.entries(data.catalog.members).forEach(([memberId, member]) => {
+            const classifications = member.classifications || (member.classifications = {});
+            if (classifications.gangMember && !roster.has(memberId)) {
+                classifications.gangMember = false;
+                classifications.formerMember = true;
+                classifications.leadershipCouncil = false;
+                classifications.gangStaff = false;
+                member.membershipState = 'former';
+                member.leftAt = member.leftAt || now;
+            }
+        });
+
+        roster.forEach((entry, memberId) => {
+            const member = data.catalog.members[memberId] || {};
+            data.catalog.members[memberId] = {
+                ...member,
+                name: entry.name,
+                profileUrl: entry.profileUrl || member.profileUrl || '',
+                membershipState: 'current',
+                classifications: {
+                    ...(member.classifications || {}),
+                    leadershipCouncil: council.has(memberId),
+                    gangStaff: staff.has(memberId),
+                    gangMember: true,
+                    formerMember: false
+                },
+                firstSeenAt: member.firstSeenAt || now,
+                lastSeenAt: now,
+                classificationCapturedAt: {
+                    ...(member.classificationCapturedAt || {}),
+                    information: now
+                }
+            };
+            delete data.catalog.members[memberId].leftAt;
+        });
+        data.sources = { ...(data.sources || {}), informationCapturedAt: now };
+        changed = true;
+    }
+
+    if (changed) HWGT_saveMemberTrackerData(data);
 })();
