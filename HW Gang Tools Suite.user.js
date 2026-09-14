@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HW Gang Tools Suite
 // @namespace    https://www.hobowars.com/
-// @version      2.0
+// @version      2.1
 // @description  Configurable gang administration tools for incentive payouts, loan reconciliation, member-stat deltas, and Gangsters Paradise Awake exports.
 // @homepageURL  https://github.com/lvl11evelyn/hw7-gang-tools/blob/main/README.md
 // @updateURL    https://github.com/lvl11evelyn/hw7-gang-tools/raw/refs/heads/main/HW%20Gang%20Tools%20Suite.user.js
@@ -2092,13 +2092,30 @@ function HWGT_setModuleEnabled(id, enabled) {
             .replace(/\r/g, '');
 
         const results = [];
+        let sectionType = null;
 
         text.split('\n').forEach(rawLine => {
             const line = rawLine.replace(/\s+/g, ' ').trim();
+            // HoboWars' formatted table markup can leave whitespace text
+            // nodes beside <br> elements, yielding harmless empty lines
+            // between a section heading and its claims.
             if (!line) return;
 
-            const parsed = parseMilestoneLine(line);
-            if (parsed) results.push(parsed);
+            const headerType = parseMilestoneTypeHeader(line);
+            if (headerType) {
+                sectionType = headerType;
+                return;
+            }
+
+            const parsed = parseMilestoneLine(line, sectionType);
+            if (parsed) {
+                results.push(parsed);
+                return;
+            }
+
+            // A real, non-claim line ends the inherited section. This avoids
+            // carrying "mining" into unrelated numeric prose later on.
+            sectionType = null;
         });
 
         if (!results.length) return null;
@@ -2122,12 +2139,51 @@ function HWGT_setModuleEnabled(id, enabled) {
         };
     }
 
-    function parseMilestoneLine(line) {
+    function parseMilestoneTypeHeader(line) {
+        const normalized = String(line || '')
+            .replace(/[\s:;\-–—]+$/g, '')
+            .trim();
+
+        if (!normalized) return null;
+
+        const matches = Object.entries(MILESTONE_SCHEDULES)
+            .filter(([, schedule]) => {
+                const match = normalized.match(schedule.aliases);
+                return match && match.index === 0 && match[0].length === normalized.length;
+            })
+            .map(([type]) => type);
+
+        return matches.length === 1 ? matches[0] : null;
+    }
+
+    function parseMilestoneLine(line, sectionType = null) {
         const candidates = [];
 
         Object.entries(MILESTONE_SCHEDULES).forEach(([type, schedule]) => {
             const labelMatch = line.match(schedule.aliases);
-            if (!labelMatch) return;
+            const usesSectionHeader = !labelMatch && type === sectionType;
+            if (!labelMatch && !usesSectionHeader) return;
+
+            if (usesSectionHeader) {
+                const leading = line.match(/^\s*([\d,]+(?:\.\d+)?)/);
+                if (!leading) return;
+
+                const reported = Number(leading[1].replace(/,/g, ''));
+                if (!Number.isFinite(reported)) return;
+
+                const resolved = resolveMilestone(schedule, reported);
+                if (!resolved) return;
+
+                candidates.push({
+                    type,
+                    reported,
+                    milestone: resolved.milestone,
+                    expectedAmount: resolved.payout,
+                    memo: schedule.memo(resolved.milestone),
+                    claimedAmount: parseClaimedPayment(line.slice(leading[0].length))
+                });
+                return;
+            }
 
             const labelIndex = labelMatch.index ?? -1;
             if (labelIndex < 0) return;
@@ -2995,12 +3051,16 @@ function HWGT_setModuleEnabled(id, enabled) {
         document.querySelectorAll('tr[id^="tr_post_"]').forEach(postRow => {
             const poster = getPoster(postRow);
             if (!poster || String(poster.id) !== String(hoboId)) return;
-            if (completedPostIds.has(String(poster.postId))) return;
+
+            const postId = String(poster.postId);
+            const alreadyPaid =
+                completedPostIds.has(postId) ||
+                hasDirectPaidEdit(postId);
 
             const parsed = parseMilestoneReply(poster.postId);
             if (!parsed?.items?.length) return;
 
-            sourcePostIds.push(String(poster.postId));
+            if (!alreadyPaid) sourcePostIds.push(postId);
 
             parsed.items.forEach(item => {
                 const claimKey = `${item.type}:${item.milestone}`;
@@ -3010,13 +3070,19 @@ function HWGT_setModuleEnabled(id, enabled) {
                 if (!claimsByKey.has(claimKey)) {
                     claimsByKey.set(claimKey, {
                         ...item,
-                        sourcePostIds: [String(poster.postId)]
+                        alreadyPaid,
+                        sourcePostIds: [postId]
                     });
                 } else {
                     const existing = claimsByKey.get(claimKey);
-                    if (!existing.sourcePostIds.includes(String(poster.postId))) {
-                        existing.sourcePostIds.push(String(poster.postId));
+                    if (!existing.sourcePostIds.includes(postId)) {
+                        existing.sourcePostIds.push(postId);
                     }
+
+                    // A milestone is one-time. If any occurrence is already
+                    // completed or carries the direct PAID edit, the same
+                    // milestone must never contribute to a new payout.
+                    existing.alreadyPaid = existing.alreadyPaid || alreadyPaid;
 
                     // Prefer a concrete claimant amount for audit display when
                     // one occurrence supplied it and the earlier occurrence did not.
@@ -3032,6 +3098,9 @@ function HWGT_setModuleEnabled(id, enabled) {
 
         const items = Array.from(claimsByKey.values());
         if (!items.length) return null;
+
+        const payableItems = items.filter(item => !item.alreadyPaid);
+        if (!payableItems.length) return null;
 
         const typeOrder = [];
         items.forEach(item => {
@@ -3049,8 +3118,10 @@ function HWGT_setModuleEnabled(id, enabled) {
             return `${label} ${milestones.join(', ')}`;
         }).join(', ');
 
-        const amount = items.reduce((sum, item) => sum + item.expectedAmount, 0);
-        const corrections = items
+        // The memo deliberately summarizes both previously paid and currently
+        // payable milestones, while the amount contains only unpaid claims.
+        const amount = payableItems.reduce((sum, item) => sum + item.expectedAmount, 0);
+        const corrections = payableItems
             .filter(item =>
                 Number.isFinite(item.claimedAmount) &&
                 item.claimedAmount !== item.expectedAmount
