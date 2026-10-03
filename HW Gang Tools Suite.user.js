@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HW Gang Tools Suite
 // @namespace    https://www.hobowars.com/
-// @version      2.1
+// @version      2.2
 // @description  Configurable gang administration tools for incentive payouts, loan reconciliation, member-stat deltas, and Gangsters Paradise Awake exports.
 // @homepageURL  https://github.com/lvl11evelyn/hw7-gang-tools/blob/main/README.md
 // @updateURL    https://github.com/lvl11evelyn/hw7-gang-tools/raw/refs/heads/main/HW%20Gang%20Tools%20Suite.user.js
@@ -1507,17 +1507,23 @@ function HWGT_setModuleEnabled(id, enabled) {
         exceptionsSummary.textContent = 'Per-Hobo Exceptions';
         const exceptionWrap = document.createElement('div');
         exceptionWrap.className = 'hwgt-exception-wrap';
+        exceptionWrap.style.scrollbarWidth = 'thin';
+        exceptionWrap.style.scrollbarColor = 'rgb(240,0,0) rgba(255,185,185,0.28)';
         const knownCatalogMembers = Object.entries(trackerData.catalog.members)
             .sort((a, b) => String(a[1].name || '').localeCompare(String(b[1].name || '')));
         const knownMembers = knownCatalogMembers.filter(([, member]) =>
             Number.isFinite(Number(member.classificationCapturedAt?.membersList))
         );
         if (!knownMembers.length) {
-            exceptionWrap.textContent = 'Visit the Members List once to populate member controls.';
+            exceptionWrap.textContent = 'View Members List.';
         } else {
             const table = document.createElement('table');
             table.className = 'hwgt-exception-table';
             const head = document.createElement('thead');
+            head.style.position = 'sticky';
+            head.style.top = '0';
+            head.style.backgroundColor = 'rgb(210,210,210)';
+            head.style.borderTop = '2px solid rgb(215,215,215)';
             const headRow = document.createElement('tr');
             ['Hobo', ...Object.values(HWGT_MEMBER_GROUPS).map(group => group.label)]
                 .forEach(text => {
